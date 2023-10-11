@@ -161,11 +161,36 @@ struct rolling_maximum_thrust_scan_local_t {
 };
 constexpr rolling_maximum_thrust_scan_local_t rolling_maximum_thrust_scan_local{};
 
+struct rolling_maximum_thrust_single_scan_local_t {
+  auto operator()(thrust::universal_vector<int>& input, std::size_t window_size) const {
+    thrust::counting_iterator<int> const iota(0);
+    thrust::transform_iterator const window(iota, index_to_window{window_size});
+
+    auto const pincer_input = thrust::make_zip_iterator(
+      thrust::make_tuple(input.begin() + window_size - 1, input.rbegin() + window_size - 1));
+
+    thrust::universal_vector<int> prefix_max(input.size() - window_size + 1);
+    thrust::universal_vector<int> suffix_max(input.size() - window_size + 1);
+    auto const pincer_output = thrust::make_zip_iterator(thrust::make_tuple(prefix_max.begin(), suffix_max.rbegin()));
+
+    thrust::inclusive_scan_by_key(window + window_size - 1, window + input.size(), pincer_input, pincer_output,
+                                  thrust::equal_to<int>{}, pincer_maximum{});
+
+    thrust::transform(prefix_max.begin(), prefix_max.end(),
+                      suffix_max.begin(), suffix_max.begin(),
+                      thrust::maximum<int>{});
+
+    return suffix_max;
+  }
+};
+constexpr rolling_maximum_thrust_single_scan_local_t rolling_maximum_thrust_single_scan_local{};
+
 using algorithms = nvbench::type_list<
   rolling_maximum_thrust_max_element_t,
   rolling_maximum_thrust_scan_t,
   rolling_maximum_thrust_single_scan_t,
-  rolling_maximum_thrust_scan_local_t
+  rolling_maximum_thrust_scan_local_t,
+  rolling_maximum_thrust_single_scan_local_t
 >;
 
 template <typename F>
@@ -189,6 +214,7 @@ void test_all_rolling_maximum(thrust::universal_vector<int> input, std::size_t w
   test_rolling_maximum(rolling_maximum_thrust_scan, input, window_size);
   test_rolling_maximum(rolling_maximum_thrust_single_scan, input, window_size);
   test_rolling_maximum(rolling_maximum_thrust_scan_local, input, window_size);
+  test_rolling_maximum(rolling_maximum_thrust_single_scan_local, input, window_size);
 }
 
 auto generate_input(std::size_t problem_size) {
