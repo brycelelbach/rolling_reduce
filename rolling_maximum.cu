@@ -123,10 +123,49 @@ struct rolling_maximum_thrust_single_scan_t {
 };
 constexpr rolling_maximum_thrust_single_scan_t rolling_maximum_thrust_single_scan{};
 
+/*
+input      = [a, b, c, d, e, f, g, h, i]
+windowed   = [a, b, c] [d, e, f] [g, h, i]
+
+PM =                   [a] [d, M(d,e), M(d,e,f)] [g, M(h,i), M(g,h,i)]
+SM = [M(c,b,a), M(c,b), c] [M(f,e,d), M(e,d), d] [g]
+
+max = M(PM[i], SM[i])
+    = [M(PM[0], SM[0]), M(PM[1], SM[1]), M(PM[2], SM[2]), ..., M(PM[6], SM[6])]
+    = [M(a, M(c,b,a)),  M(d, M(c,b)),    M(M(d,e), c),    ..., M(M(g,h,i), g)]
+*/
+
+struct rolling_maximum_thrust_scan_local_t {
+  auto operator()(thrust::universal_vector<int>& input, std::size_t window_size) const {
+    thrust::counting_iterator<int> iota(0);
+    thrust::transform_iterator window(iota, index_to_window{window_size});
+
+    thrust::universal_vector<int> prefix_max(input.size() - window_size + 1);
+    thrust::inclusive_scan_by_key(window + window_size - 1, window + input.size(),
+                                  input.begin() + window_size - 1,
+                                  prefix_max.begin(),
+                                  thrust::equal_to<int>{}, thrust::maximum<int>{});
+
+    thrust::universal_vector<int> suffix_max(input.size() - window_size + 1);
+    thrust::inclusive_scan_by_key(window + window_size - 1, window + input.size(),
+                                  input.rbegin() + window_size - 1,
+                                  suffix_max.rbegin(),
+                                  thrust::equal_to<int>{}, thrust::maximum<int>{});
+
+    thrust::transform(prefix_max.begin(), prefix_max.end(),
+                      suffix_max.begin(), prefix_max.begin(),
+                      thrust::maximum<int>{});
+
+    return prefix_max;
+  }
+};
+constexpr rolling_maximum_thrust_scan_local_t rolling_maximum_thrust_scan_local{};
+
 using algorithms = nvbench::type_list<
   rolling_maximum_thrust_max_element_t,
   rolling_maximum_thrust_scan_t,
-  rolling_maximum_thrust_single_scan_t
+  rolling_maximum_thrust_single_scan_t,
+  rolling_maximum_thrust_scan_local_t
 >;
 
 template <typename F>
@@ -149,6 +188,7 @@ void test_all_rolling_maximum(thrust::universal_vector<int> input, std::size_t w
   test_rolling_maximum(rolling_maximum_thrust_max_element, input, window_size);
   test_rolling_maximum(rolling_maximum_thrust_scan, input, window_size);
   test_rolling_maximum(rolling_maximum_thrust_single_scan, input, window_size);
+  test_rolling_maximum(rolling_maximum_thrust_scan_local, input, window_size);
 }
 
 auto generate_input(std::size_t problem_size) {
