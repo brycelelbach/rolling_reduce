@@ -81,11 +81,11 @@ struct rolling_maximum_thrust_scan_t {
                                   thrust::equal_to<int>{}, thrust::maximum<int>{});
 
     thrust::transform(prefix_max.begin() + window_size - 1, prefix_max.end(),
-                      suffix_max.begin(), prefix_max.begin(),
+                      suffix_max.begin(), suffix_max.begin(),
                       thrust::maximum<int>{});
-    prefix_max.resize(input.size() - window_size + 1);
+    suffix_max.resize(input.size() - window_size + 1);
 
-    return prefix_max;
+    return suffix_max;
   }
 };
 constexpr rolling_maximum_thrust_scan_t rolling_maximum_thrust_scan{};
@@ -114,11 +114,11 @@ struct rolling_maximum_thrust_single_scan_t {
                                   thrust::equal_to<int>{}, pincer_maximum{});
 
     thrust::transform(prefix_max.begin() + window_size - 1, prefix_max.end(),
-                      suffix_max.begin(), prefix_max.begin(),
+                      suffix_max.begin(), suffix_max.begin(),
                       thrust::maximum<int>{});
-    prefix_max.resize(input.size() - window_size + 1);
+    suffix_max.resize(input.size() - window_size + 1);
 
-    return prefix_max;
+    return suffix_max;
   }
 };
 constexpr rolling_maximum_thrust_single_scan_t rolling_maximum_thrust_single_scan{};
@@ -185,6 +185,9 @@ NVBENCH_BENCH_TYPES(benchmark_rolling_maximum, NVBENCH_TYPE_AXES(algorithms))
 int main(int argc, char const* const* argv) {
   test_all_rolling_maximum({3, 8, 1, 2}, 2);
   test_all_rolling_maximum({1, 6, 3, 8, 9, 6, 5, 4, 3}, 3);
+  test_all_rolling_maximum(generate_input(1024), 2);
+  test_all_rolling_maximum(generate_input(1024), 4);
+  test_all_rolling_maximum(generate_input(1024), 64);
 
   NVBENCH_MAIN_BODY(argc, argv);
 }
