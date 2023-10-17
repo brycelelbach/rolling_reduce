@@ -58,23 +58,27 @@ CUB_NAMESPACE_BEGIN
  */
 template <typename ChainedPolicyT,
           typename KeysInputIteratorT,
-          typename UnzippedInputIteratorT,
-          typename ZippedInputIteratorT,
+          typename InputIteratorT,
+          typename ReverseInputIteratorT,
           typename OutputIteratorT,
-          typename RollingReduceTileStateT,
-          typename UnzippedReductionOpT,
+          typename ReverseOutputIteratorT,
+          typename SuffixTileStateT,
+          typename PrefixTileStateT,
+          typename ReductionOpT,
           typename OffsetT,
-          typename UnzippedAccumT,
+          typename AccumT,
           typename KeyT = cub::detail::value_t<KeysInputIteratorT>>
 __launch_bounds__(int(ChainedPolicyT::ActivePolicy::ScanByKeyPolicyT::BLOCK_THREADS))
 CUB_DETAIL_KERNEL_ATTRIBUTES void DeviceRollingReduceKernel(KeysInputIteratorT d_keys_in,
                                                             KeyT *d_keys_prev_in,
-                                                            UnzippedInputIteratorT d_in,
-                                                            ZippedInputIteratorT d_zipped_in,
+                                                            InputIteratorT d_in,
+                                                            ReverseInputIteratorT d_reverse_in,
                                                             OutputIteratorT d_out,
-                                                            RollingReduceTileStateT tile_state,
+                                                            ReverseOutputIteratorT d_reverse_out,
+                                                            SuffixTileStateT suffix_tile_state,
+                                                            PrefixTileStateT prefix_tile_state,
                                                             int start_tile,
-                                                            UnzippedReductionOpT reduction_op,
+                                                            ReductionOpT reduction_op,
                                                             OffsetT num_items)
 {
   using RollingReducePolicyT =
@@ -82,11 +86,11 @@ CUB_DETAIL_KERNEL_ATTRIBUTES void DeviceRollingReduceKernel(KeysInputIteratorT d
 
   // Thread block type for scanning input tiles
   using AgentRollingReduceT = AgentRollingReduce<RollingReducePolicyT,
-                                                 UnzippedInputIteratorT,
+                                                 InputIteratorT,
                                                  OutputIteratorT,
-                                                 UnzippedReductionOpT,
+                                                 ReductionOpT,
                                                  OffsetT,
-                                                 UnzippedAccumT>;
+                                                 AccumT>;
 
   // Shared memory for AgentRollingReduce
   __shared__ typename AgentRollingReduceT::TempStorage temp_storage;
@@ -96,10 +100,35 @@ CUB_DETAIL_KERNEL_ATTRIBUTES void DeviceRollingReduceKernel(KeysInputIteratorT d
                       d_keys_in,
                       d_keys_prev_in,
                       d_in,
-                      d_zipped_in,
+                      d_reverse_in,
                       d_out,
+                      d_reverse_out,
                       reduction_op)
-    .ConsumeRange(num_items, tile_state, start_tile);
+    .ConsumeRange(num_items, suffix_tile_state, prefix_tile_state, start_tile);
+}
+
+template <typename SuffixTileStateT,
+          typename PrefixTileStateT,
+          typename KeysInputIteratorT>
+CUB_DETAIL_KERNEL_ATTRIBUTES void
+DeviceRollingReduceInitKernel(SuffixTileStateT suffix_tile_state,
+                              PrefixTileStateT prefix_tile_state,
+                              KeysInputIteratorT d_keys_in,
+                              cub::detail::value_t<KeysInputIteratorT> *d_keys_prev_in,
+                              unsigned items_per_tile,
+                              int num_tiles)
+{
+  // Initialize tile status
+  suffix_tile_state.InitializeStatus(num_tiles);
+  prefix_tile_state.InitializeStatus(num_tiles);
+
+  const unsigned tid       = threadIdx.x + blockDim.x * blockIdx.x;
+  const unsigned tile_base = tid * items_per_tile;
+
+  if (tid > 0 && tid < num_tiles)
+  {
+    d_keys_prev_in[tid] = d_keys_in[tile_base - 1];
+  }
 }
 
 /******************************************************************************
@@ -112,20 +141,20 @@ CUB_DETAIL_KERNEL_ATTRIBUTES void DeviceRollingReduceKernel(KeysInputIteratorT d
  *
  */
 template <
-  typename UnzippedInputIteratorT,
+  typename InputIteratorT,
   typename OutputIteratorT,
-  typename UnzippedReductionOpT,
+  typename ReductionOpT,
   typename OffsetT,
-  typename UnzippedAccumT =
-    detail::accumulator_t<UnzippedReductionOpT,
-                          cub::detail::value_t<UnzippedInputIteratorT>,
-                          cub::detail::value_t<UnzippedInputIteratorT>>,
+  typename AccumT =
+    detail::accumulator_t<ReductionOpT,
+                          cub::detail::value_t<InputIteratorT>,
+                          cub::detail::value_t<InputIteratorT>>,
+  // TODO: We should do our own tuning.
   typename SelectedPolicy = DeviceScanByKeyPolicy<
     thrust::transform_iterator<IndexToWindow<OffsetT>, thrust::counting_iterator<OffsetT>>,
-    thrust::tuple<UnzippedAccumT, UnzippedAccumT>,
-    cub::detail::value_t<thrust::zip_iterator<
-      thrust::tuple<UnzippedInputIteratorT, thrust::reverse_iterator<UnzippedInputIteratorT>>>>,
-    ZippedReduce<UnzippedReductionOpT>>>
+    AccumT,
+    InputIteratorT,
+    ReductionOpT>>
 struct DispatchRollingReduce : SelectedPolicy
 {
   //---------------------------------------------------------------------
@@ -134,16 +163,13 @@ struct DispatchRollingReduce : SelectedPolicy
 
   static constexpr int INIT_KERNEL_THREADS = 128;
 
-  using KeysInputIteratorT   = thrust::transform_iterator<
+  using KeysInputIteratorT     = thrust::transform_iterator<
     IndexToWindow<OffsetT>, thrust::counting_iterator<OffsetT>>;
-  using ZippedInputIteratorT = thrust::zip_iterator<
-    thrust::tuple<UnzippedInputIteratorT, thrust::reverse_iterator<UnzippedInputIteratorT>>>;
+  using ReverseInputIteratorT  = thrust::reverse_iterator<InputIteratorT>;
+  using ReverseOutputIteratorT = thrust::reverse_iterator<OutputIteratorT>;
 
-  using AccumT = thrust::tuple<UnzippedAccumT, UnzippedAccumT>;
-
-  using KeyT           = OffsetT;
-  using InputT         = cub::detail::value_t<ZippedInputIteratorT>;
-  using UnzippedInputT = cub::detail::value_t<UnzippedInputIteratorT>;
+  using KeyT               = OffsetT;
+  using InputT             = cub::detail::value_t<InputIteratorT>;
 
   /// Device-accessible allocation of temporary storage. When `nullptr`, the
   /// required allocation size is written to `temp_storage_bytes` and no work
@@ -157,16 +183,19 @@ struct DispatchRollingReduce : SelectedPolicy
   KeysInputIteratorT d_keys_in;
 
   /// Iterator to the input sequence of value items
-  UnzippedInputIteratorT d_in;
+  InputIteratorT d_in;
 
   /// Iterator to the input sequence of value items
-  ZippedInputIteratorT d_zipped_in;
+  ReverseInputIteratorT d_reverse_in;
 
-  /// Iterator to the input sequence of value items
+  /// Iterator to the output sequence of value items
   OutputIteratorT d_out;
 
+  /// Iterator to the output sequence of value items
+  ReverseOutputIteratorT d_reverse_out;
+
   /// Binary scan functor
-  UnzippedReductionOpT reduction_op;
+  ReductionOpT reduction_op;
 
   /// Total number of input items (i.e., the length of `d_in`)
   OffsetT num_items;
@@ -180,22 +209,22 @@ struct DispatchRollingReduce : SelectedPolicy
 
   CUB_RUNTIME_FUNCTION CUB_FORCE_INLINE
   DispatchRollingReduce(void *d_temp_storage,
-                    size_t &temp_storage_bytes,
-                    UnzippedInputIteratorT d_in,
-                    OutputIteratorT d_out,
-                    UnzippedReductionOpT reduction_op,
-                    OffsetT num_items,
-                    OffsetT window_size,
-                    cudaStream_t stream,
-                    int ptx_version)
+                        size_t &temp_storage_bytes,
+                        InputIteratorT d_in,
+                        OutputIteratorT d_out,
+                        ReductionOpT reduction_op,
+                        OffsetT num_items,
+                        OffsetT window_size,
+                        cudaStream_t stream,
+                        int ptx_version)
       : d_temp_storage(d_temp_storage)
       , temp_storage_bytes(temp_storage_bytes)
       , d_keys_in(thrust::make_transform_iterator(
           thrust::counting_iterator<OffsetT>(0), IndexToWindow(window_size)) + window_size - 1)
-      , d_in(d_in)
-      , d_zipped_in(thrust::make_zip_iterator(thrust::make_tuple(
-          d_in, thrust::make_reverse_iterator(d_in + num_items))) + window_size - 1)
+      , d_in(d_in + window_size - 1)
+      , d_reverse_in(thrust::make_reverse_iterator(d_in + num_items) + window_size - 1)
       , d_out(d_out)
+      , d_reverse_out(thrust::make_reverse_iterator(d_out + num_items) + window_size - 1)
       , reduction_op(reduction_op)
       , num_items(num_items - window_size + 1)
       , window_size(window_size)
@@ -206,15 +235,15 @@ struct DispatchRollingReduce : SelectedPolicy
   CUB_DETAIL_RUNTIME_DEBUG_SYNC_IS_NOT_SUPPORTED
   CUB_RUNTIME_FUNCTION CUB_FORCE_INLINE
   DispatchRollingReduce(void *d_temp_storage,
-                    size_t &temp_storage_bytes,
-                    UnzippedInputIteratorT d_in,
-                    OutputIteratorT d_out,
-                    UnzippedReductionOpT reduction_op,
-                    OffsetT num_items,
-                    OffsetT window_size,
-                    cudaStream_t stream,
-                    bool debug_synchronous,
-                    int ptx_version)
+                        size_t &temp_storage_bytes,
+                        InputIteratorT d_in,
+                        OutputIteratorT d_out,
+                        ReductionOpT reduction_op,
+                        OffsetT num_items,
+                        OffsetT window_size,
+                        cudaStream_t stream,
+                        bool debug_synchronous,
+                        int ptx_version)
       : DispatchRollingReduce(d_temp_storage, temp_storage_bytes, d_in, d_out,
           reduction_op, num_items, window_size, stream, ptx_version)
   {
@@ -226,7 +255,10 @@ struct DispatchRollingReduce : SelectedPolicy
   Invoke(InitKernel init_kernel, ScanKernel scan_kernel)
   {
     using Policy = typename ActivePolicyT::ScanByKeyPolicyT;
-    using RollingReduceTileStateT = ReduceByKeyScanTileState<AccumT, OffsetT>;
+    using RollingReduceSuffixTileStateT =
+      SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_relaxed>;
+    using RollingReducePrefixTileStateT =
+      SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_acq_rel>;
 
     cudaError error = cudaSuccess;
     do
@@ -245,18 +277,23 @@ struct DispatchRollingReduce : SelectedPolicy
         static_cast<int>(cub::DivideAndRoundUp(num_items, tile_size));
 
       // Specify temporary storage allocation requirements
-      size_t allocation_sizes[2];
-      error = CubDebug(RollingReduceTileStateT::AllocationSize(num_tiles, allocation_sizes[0]));
+      size_t allocation_sizes[3];
+      error = CubDebug(RollingReduceSuffixTileStateT::AllocationSize(num_tiles, allocation_sizes[0]));
+      if (cudaSuccess != error)
+      {
+        break; // bytes needed for tile status descriptors
+      }
+      error = CubDebug(RollingReducePrefixTileStateT::AllocationSize(num_tiles, allocation_sizes[1]));
       if (cudaSuccess != error)
       {
         break; // bytes needed for tile status descriptors
       }
 
-      allocation_sizes[1] = sizeof(KeyT) * (num_tiles + 1);
+      allocation_sizes[2] = sizeof(KeyT) * (num_tiles + 1);
 
       // Compute allocation pointers into the single storage blob (or compute
       // the necessary size of the blob)
-      void *allocations[2] = {};
+      void *allocations[3] = {};
 
       error = CubDebug(
         AliasTemporaries(d_temp_storage, temp_storage_bytes, allocations, allocation_sizes));
@@ -278,11 +315,13 @@ struct DispatchRollingReduce : SelectedPolicy
         break;
       }
 
-      KeyT *d_keys_prev_in = reinterpret_cast<KeyT *>(allocations[1]);
+      KeyT *d_keys_prev_in = reinterpret_cast<KeyT *>(allocations[2]);
 
       // Construct the tile status interface
-      RollingReduceTileStateT tile_state;
-      error = CubDebug(tile_state.Init(num_tiles, allocations[0], allocation_sizes[0]));
+      RollingReduceSuffixTileStateT suffix_tile_state;
+      RollingReducePrefixTileStateT prefix_tile_state;
+      error = CubDebug(suffix_tile_state.Init(num_tiles, allocations[1], allocation_sizes[1]));
+      error = CubDebug(prefix_tile_state.Init(num_tiles, allocations[0], allocation_sizes[0]));
       if (cudaSuccess != error)
       {
         break;
@@ -305,7 +344,8 @@ struct DispatchRollingReduce : SelectedPolicy
         0,
         stream)
         .doit(init_kernel,
-              tile_state,
+              suffix_tile_state,
+              prefix_tile_state,
               d_keys_in,
               d_keys_prev_in,
               tile_size,
@@ -371,9 +411,11 @@ struct DispatchRollingReduce : SelectedPolicy
                 d_keys_in,
                 d_keys_prev_in,
                 d_in,
-                d_zipped_in,
+                d_reverse_in,
                 d_out,
-                tile_state,
+                d_reverse_out,
+                suffix_tile_state,
+                prefix_tile_state,
                 start_tile,
                 reduction_op,
                 num_items);
@@ -401,28 +443,35 @@ struct DispatchRollingReduce : SelectedPolicy
   CUB_RUNTIME_FUNCTION __host__ CUB_FORCE_INLINE cudaError_t Invoke()
   {
     using MaxPolicyT = typename DispatchRollingReduce::MaxPolicy;
-    using RollingReduceTileStateT = ReduceByKeyScanTileState<AccumT, OffsetT>;
+    using RollingReduceSuffixTileStateT =
+      SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_relaxed>;
+    using RollingReducePrefixTileStateT =
+      SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_acq_rel>;
 
     // Ensure kernels are instantiated.
     return Invoke<ActivePolicyT>(
-      DeviceScanByKeyInitKernel<RollingReduceTileStateT, KeysInputIteratorT>,
+      DeviceRollingReduceInitKernel<RollingReduceSuffixTileStateT,
+                                    RollingReducePrefixTileStateT,
+                                    KeysInputIteratorT>,
       DeviceRollingReduceKernel<MaxPolicyT,
                                 KeysInputIteratorT,
-                                UnzippedInputIteratorT,
-                                ZippedInputIteratorT,
+                                InputIteratorT,
+                                ReverseInputIteratorT,
                                 OutputIteratorT,
-                                RollingReduceTileStateT,
-                                UnzippedReductionOpT,
+                                ReverseOutputIteratorT,
+                                RollingReduceSuffixTileStateT,
+                                RollingReducePrefixTileStateT,
+                                ReductionOpT,
                                 OffsetT,
-                                UnzippedAccumT>);
+                                AccumT>);
   }
 
   CUB_RUNTIME_FUNCTION CUB_FORCE_INLINE static cudaError_t
   Dispatch(void *d_temp_storage,
            size_t &temp_storage_bytes,
-           UnzippedInputIteratorT d_in,
+           InputIteratorT d_in,
            OutputIteratorT d_out,
-           UnzippedReductionOpT reduction_op,
+           ReductionOpT reduction_op,
            OffsetT num_items,
            OffsetT window_size,
            cudaStream_t stream)
@@ -467,9 +516,9 @@ struct DispatchRollingReduce : SelectedPolicy
   CUB_RUNTIME_FUNCTION CUB_FORCE_INLINE static cudaError_t
   Dispatch(void *d_temp_storage,
            size_t &temp_storage_bytes,
-           UnzippedInputIteratorT d_in,
+           InputIteratorT d_in,
            OutputIteratorT d_out,
-           UnzippedReductionOpT reduction_op,
+           ReductionOpT reduction_op,
            OffsetT num_items,
            OffsetT window_size,
            cudaStream_t stream,

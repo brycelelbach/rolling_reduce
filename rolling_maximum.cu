@@ -99,7 +99,6 @@ struct pincer_maximum {
   __host__ __device__
   auto operator()(thrust::tuple<int, int> left, thrust::tuple<int, int> right) const {
     constexpr thrust::maximum<int> mx{};
-    printf("prefix: %d %d, suffix %d %d\n", thrust::get<0>(left), thrust::get<0>(right), thrust::get<1>(left), thrust::get<1>(right));
     return thrust::make_tuple(mx(thrust::get<0>(left), thrust::get<0>(right)),
                               mx(thrust::get<1>(left), thrust::get<1>(right)));
   }
@@ -191,7 +190,7 @@ struct rolling_maximum_thrust_single_scan_local_t {
 };
 constexpr rolling_maximum_thrust_single_scan_local_t rolling_maximum_thrust_single_scan_local{};
 
-struct rolling_maximum_thrust_single_merged_scan_local_t {
+struct rolling_maximum_thrust_single_pass_t {
   auto operator()(thrust::universal_vector<int>& input, std::size_t window_size) const {
     std::size_t tmp_storage = 0;
     cub::DeviceRollingReduce::RollingReduce(
@@ -201,16 +200,19 @@ struct rolling_maximum_thrust_single_merged_scan_local_t {
     auto tmp = thrust::uninitialized_allocate_unique_n<cuda::std::byte>(
       thrust::universal_allocator<cuda::std::byte>{}, tmp_storage);
 
+    thrust::universal_vector<int> output(input.size() - window_size + 1);
     cub::DeviceRollingReduce::RollingReduce(
-      thrust::raw_pointer_cast(tmp.get()), tmp_storage, input.begin(), input.begin(),
+      thrust::raw_pointer_cast(tmp.get()), tmp_storage, input.begin(), output.begin(),
       thrust::maximum<int>{}, input.size(), window_size);
 
     cudaDeviceSynchronize();
+    //input.resize(input.size() - window_size + 1);
 
-    return input;
+    //return input;
+    return output;
   }
 };
-constexpr rolling_maximum_thrust_single_merged_scan_local_t rolling_maximum_thrust_single_merged_scan_local{};
+constexpr rolling_maximum_thrust_single_pass_t rolling_maximum_thrust_single_pass{};
 
 using algorithms = nvbench::type_list<
   rolling_maximum_thrust_max_element_t,
@@ -218,7 +220,7 @@ using algorithms = nvbench::type_list<
   rolling_maximum_thrust_single_scan_t,
   rolling_maximum_thrust_scan_local_t,
   rolling_maximum_thrust_single_scan_local_t,
-  rolling_maximum_thrust_single_merged_scan_local_t
+  rolling_maximum_thrust_single_pass_t
 >;
 
 template <typename F>
@@ -230,13 +232,21 @@ void debug_rolling_maximum(F f, thrust::universal_vector<int>& input, std::size_
 
 template <typename F>
 void test_rolling_maximum(F f, thrust::universal_vector<int>& input, std::size_t window_size) {
+  std::cout << "window_size: " << window_size << "\n";
+/*
   std::cout << "input:   ";
   for (auto&& i: input)
     std::cout << i << " ";
   std::cout << "\n";
+*/
   auto gold = rolling_maximum_ranges_cpp20(input, window_size);
   auto output = f(input, window_size);
   if (gold.size() != output.size() || !thrust::equal(gold.begin(), gold.end(), output.begin())) {
+    for (auto idx : std::views::iota(0ULL, gold.size())) {
+      if (gold[idx] != output[idx])
+      std::cout << idx << ": " << gold[idx] << " " << output[idx] << "\n";
+    }
+/*
     std::cout << "gold:   ";
     for (auto&& i: gold)
       std::cout << i << " ";
@@ -246,6 +256,7 @@ void test_rolling_maximum(F f, thrust::universal_vector<int>& input, std::size_t
     for (auto&& i: output)
       std::cout << i << " ";
     std::cout << "\n";
+*/
 
     throw false;
   }
@@ -257,7 +268,7 @@ void test_all_rolling_maximum(thrust::universal_vector<int> input, std::size_t w
   //test_rolling_maximum(rolling_maximum_thrust_single_scan, input, window_size);
   //test_rolling_maximum(rolling_maximum_thrust_scan_local, input, window_size);
   //test_rolling_maximum(rolling_maximum_thrust_single_scan_local, input, window_size);
-  test_rolling_maximum(rolling_maximum_thrust_single_merged_scan_local, input, window_size);
+  test_rolling_maximum(rolling_maximum_thrust_single_pass, input, window_size);
 }
 
 auto generate_input(std::size_t problem_size) {
@@ -292,12 +303,15 @@ NVBENCH_BENCH_TYPES(benchmark_rolling_maximum, NVBENCH_TYPE_AXES(algorithms))
 ;
 
 int main(int argc, char const* const* argv) {
-  //test_all_rolling_maximum({3, 8, 1, 2}, 2);
-  //test_all_rolling_maximum({1, 6, 3, 8, 9, 6, 5, 4, 3}, 3);
+  test_all_rolling_maximum({3, 8, 1, 2}, 2);
+  test_all_rolling_maximum({1, 6, 3, 8, 9, 6, 5, 4, 3}, 3);
   test_all_rolling_maximum({1, 2, 3, 6, 5, 4, 7, 8, 9}, 3);
-  //test_all_rolling_maximum(generate_input(1024), 2);
-  //test_all_rolling_maximum(generate_input(1024), 4);
-  //test_all_rolling_maximum(generate_input(1024), 64);
+  test_all_rolling_maximum({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, 2);
+  test_all_rolling_maximum(generate_input(1024), 2);
+  test_all_rolling_maximum(generate_input(1024), 2);
+  test_all_rolling_maximum(generate_input(1024), 4);
+  test_all_rolling_maximum(generate_input(1024), 64);
+  test_all_rolling_maximum(generate_input(16384), 2);
 
   //NVBENCH_MAIN_BODY(argc, argv);
 }
