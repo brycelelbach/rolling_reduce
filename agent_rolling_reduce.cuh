@@ -48,7 +48,7 @@
 #include <thrust/iterator/reverse_iterator.h>
 #include <thrust/iterator/zip_iterator.h>
 
-#include <cuda/std/atomic>
+#include <cuda/atomic>
 
 #include <iterator>
 
@@ -216,10 +216,10 @@ struct SynchronizingScanByKeyTileState<KeyT, ValueT, MemoryOrder, false>
      */
     template <class DelayT = detail::default_no_delay_t>
     __device__ CUB_FORCE_INLINE void WaitForValid(
-        int             tile_idx,
-        StatusWord      &status,
-        T               &value,
-        DelayT          delay = {})
+        int        tile_idx,
+        StatusWord &status,
+        T          &value,
+        DelayT     delay = {})
     {
         do
         {
@@ -628,7 +628,6 @@ struct AgentRollingReduce
   // Block scan utility methods (first tile)
   //---------------------------------------------------------------------
 
-  // TODO: Refactor more code into here and align the interface.
   template <bool IS_LAST_TILE, typename ScanTileStateT>
   __device__ CUB_FORCE_INLINE void
   ScanFirstTile(SizeValuePairT (&scan_items)[ITEMS_PER_THREAD],
@@ -643,6 +642,8 @@ struct AgentRollingReduce
     {
       if (!IS_LAST_TILE)
       {
+        // TODO: Remove this debugging code.
+        //printf("ScanFirstTile, tile_aggregate: %d\n", tile_aggregate.value);
         tile_state.SetInclusive(0, tile_aggregate);
       }
 
@@ -654,7 +655,6 @@ struct AgentRollingReduce
   // Block scan utility methods (subsequent tiles)
   //---------------------------------------------------------------------
 
-  // TODO: Refactor more code into here and align the interface.
   template <bool IS_LAST_TILE, typename LookbackOp>
   __device__ CUB_FORCE_INLINE void
   ScanSubsequentTile(SizeValuePairT (&scan_items)[ITEMS_PER_THREAD],
@@ -713,6 +713,9 @@ struct AgentRollingReduce
     #pragma unroll
     for (int ITEM = 0; ITEM < ITEMS_PER_THREAD; ++ITEM)
     {
+      // TODO: Remove this debugging code.
+      //if (blockIdx.x == 0 && threadIdx.x == 0)
+      //  printf("FinalReduce, thread: 0, item: %d, suffix: %d, prefix: %d\n", ITEM, suffix[ITEM], prefix[ITEM]);
       final[ITEM] = reduce_op(suffix[ITEM], prefix[ITEM]);
     }
   }
@@ -756,7 +759,6 @@ struct AgentRollingReduce
     if (IS_LAST_TILE)
     {
       // Fill last element with the first element because collectives are not guarded
-
       BlockLoadValuesT(storage.load_suffix)
         .Load(d_reverse_in + tile_base,
               suffix,
@@ -836,6 +838,9 @@ struct AgentRollingReduce
         .Store(d_reverse_out + tile_base, suffix);
     }
 
+    cuda::atomic_thread_fence(cuda::memory_order_release,
+                              cuda::thread_scope_device);
+
     CTA_SYNC();
 
     ///////////////////////////////////////////////////////////////////////////
@@ -893,7 +898,7 @@ struct AgentRollingReduce
     // Compute the final results using the prefix and suffix scans
 
     AccumT final[ITEMS_PER_THREAD];
-    FinalReduce(prefix, suffix, final);
+    FinalReduce(suffix, prefix, final);
 
     ///////////////////////////////////////////////////////////////////////////
     // Store final result

@@ -10,6 +10,7 @@
 #include <thrust/functional.h>
 #include <thrust/scan.h>
 #include <thrust/extrema.h>
+#include <thrust/sequence.h>
 #include <thrust/allocate_unique.h>
 
 #include "device_rolling_reduce.cuh"
@@ -19,7 +20,7 @@
 #include <nvbench/nvbench.cuh>
 #include <nvbench/main.cuh>
 
-auto rolling_maximum_ranges_cpp20(thrust::universal_vector<int>& input, std::size_t window_size) {
+auto rolling_maximum_ranges_cpp20(thrust::universal_vector<int> input, std::size_t window_size) {
   auto const output_size = input.size() - window_size + 1;
   thrust::universal_vector<int> out_vector;
   out_vector.reserve(output_size);
@@ -40,7 +41,7 @@ struct local_maximum {
 };
 
 struct rolling_maximum_thrust_max_element_t {
-  auto operator()(thrust::universal_vector<int>& input, std::size_t window_size) const {
+  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
     auto const output_size = input.size() - window_size + 1;
     thrust::universal_vector<int> out_vector(output_size);
 
@@ -73,7 +74,7 @@ struct index_to_window {
 };
 
 struct rolling_maximum_thrust_scan_t {
-  auto operator()(thrust::universal_vector<int>& input, std::size_t window_size) const {
+  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
     thrust::counting_iterator<int> iota(0);
     thrust::transform_iterator window(iota, index_to_window{window_size});
 
@@ -105,7 +106,7 @@ struct pincer_maximum {
 };
 
 struct rolling_maximum_thrust_single_scan_t {
-  auto operator()(thrust::universal_vector<int>& input, std::size_t window_size) const {
+  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
     thrust::counting_iterator<int> const iota(0);
     thrust::transform_iterator const window(iota, index_to_window{window_size});
 
@@ -141,7 +142,7 @@ max = M(PM[i], SM[i])
 */
 
 struct rolling_maximum_thrust_scan_local_t {
-  auto operator()(thrust::universal_vector<int>& input, std::size_t window_size) const {
+  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
     thrust::counting_iterator<int> iota(0);
     thrust::transform_iterator window(iota, index_to_window{window_size});
 
@@ -167,7 +168,7 @@ struct rolling_maximum_thrust_scan_local_t {
 constexpr rolling_maximum_thrust_scan_local_t rolling_maximum_thrust_scan_local{};
 
 struct rolling_maximum_thrust_single_scan_local_t {
-  auto operator()(thrust::universal_vector<int>& input, std::size_t window_size) const {
+  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
     auto const iota = thrust::make_counting_iterator(0);
     auto const window = thrust::make_transform_iterator(iota, index_to_window{window_size});
 
@@ -191,7 +192,7 @@ struct rolling_maximum_thrust_single_scan_local_t {
 constexpr rolling_maximum_thrust_single_scan_local_t rolling_maximum_thrust_single_scan_local{};
 
 struct rolling_maximum_thrust_single_pass_t {
-  auto operator()(thrust::universal_vector<int>& input, std::size_t window_size) const {
+  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
     std::size_t tmp_storage = 0;
     cub::DeviceRollingReduce::RollingReduce(
       NULL, tmp_storage, input.begin(), input.begin(),
@@ -205,21 +206,22 @@ struct rolling_maximum_thrust_single_pass_t {
       thrust::raw_pointer_cast(tmp.get()), tmp_storage, input.begin(), output.begin(),
       thrust::maximum<int>{}, input.size(), window_size);
 
-    cudaDeviceSynchronize();
-    //input.resize(input.size() - window_size + 1);
+    cudaError_t const error = cudaDeviceSynchronize();
+    if (error != cudaSuccess) throw false;
 
-    //return input;
     return output;
   }
 };
 constexpr rolling_maximum_thrust_single_pass_t rolling_maximum_thrust_single_pass{};
 
 using algorithms = nvbench::type_list<
+/*
   rolling_maximum_thrust_max_element_t,
   rolling_maximum_thrust_scan_t,
   rolling_maximum_thrust_single_scan_t,
   rolling_maximum_thrust_scan_local_t,
   rolling_maximum_thrust_single_scan_local_t,
+*/
   rolling_maximum_thrust_single_pass_t
 >;
 
@@ -232,43 +234,47 @@ void debug_rolling_maximum(F f, thrust::universal_vector<int>& input, std::size_
 
 template <typename F>
 void test_rolling_maximum(F f, thrust::universal_vector<int>& input, std::size_t window_size) {
-  std::cout << "window_size: " << window_size << "\n";
-/*
-  std::cout << "input:   ";
-  for (auto&& i: input)
-    std::cout << i << " ";
-  std::cout << "\n";
-*/
   auto gold = rolling_maximum_ranges_cpp20(input, window_size);
   auto output = f(input, window_size);
   if (gold.size() != output.size() || !thrust::equal(gold.begin(), gold.end(), output.begin())) {
-    for (auto idx : std::views::iota(0ULL, gold.size())) {
-      if (gold[idx] != output[idx])
-      std::cout << idx << ": " << gold[idx] << " " << output[idx] << "\n";
-    }
-/*
-    std::cout << "gold:   ";
-    for (auto&& i: gold)
-      std::cout << i << " ";
-    std::cout << "\n";
+    std::cout << "Test failed, input size: " << input.size()
+              << ", window size: " << window_size << "\n";
 
-    std::cout << "output: ";
-    for (auto&& i: output)
-      std::cout << i << " ";
-    std::cout << "\n";
-*/
+    if (input.size() < 1024) {
+      std::cout << "input:  ";
+      for (auto&& i: input) std::cout << i << " ";
+      std::cout << "\n";
+
+      std::cout << "gold:   ";
+      for (auto&& i: gold) std::cout << i << " ";
+      std::cout << "\n";
+
+      std::cout << "output: ";
+      for (auto&& i: output) std::cout << i << " ";
+      std::cout << "\n";
+    } else {
+      for (auto idx : std::views::iota(0ULL, gold.size())) {
+        if (gold[idx] != output[idx])
+          std::cout << "Mismatch at index " << idx
+                    << ", gold: " << gold[idx]
+                    << ", output: " << output[idx] << "\n";
+      }
+    }
 
     throw false;
   }
 }
 
+template <typename Algorithm, typename... Tail>
+void test_all_rolling_maximum(nvbench::type_list<Algorithm, Tail...>,
+                              thrust::universal_vector<int>& input, std::size_t window_size) {
+  test_rolling_maximum(Algorithm{}, input, window_size);
+  if constexpr (sizeof...(Tail) > 0)
+    test_all_rolling_maximum(nvbench::type_list<Tail...>{}, input, window_size);
+}
+
 void test_all_rolling_maximum(thrust::universal_vector<int> input, std::size_t window_size) {
-  //test_rolling_maximum(rolling_maximum_thrust_max_element, input, window_size);
-  //test_rolling_maximum(rolling_maximum_thrust_scan, input, window_size);
-  //test_rolling_maximum(rolling_maximum_thrust_single_scan, input, window_size);
-  //test_rolling_maximum(rolling_maximum_thrust_scan_local, input, window_size);
-  //test_rolling_maximum(rolling_maximum_thrust_single_scan_local, input, window_size);
-  test_rolling_maximum(rolling_maximum_thrust_single_pass, input, window_size);
+  test_all_rolling_maximum(algorithms{}, input, window_size);
 }
 
 auto generate_input(std::size_t problem_size) {
@@ -278,6 +284,12 @@ auto generate_input(std::size_t problem_size) {
   thrust::universal_vector<int> input(problem_size);
   std::generate(input.begin(), input.end(), [&] { return dist(rng); });
 
+  return std::move(input);
+}
+
+auto generate_iota(std::size_t problem_size, int init) {
+  thrust::universal_vector<int> input(problem_size);
+  thrust::sequence(input.rbegin(), input.rend(), init);
   return std::move(input);
 }
 
@@ -308,10 +320,10 @@ int main(int argc, char const* const* argv) {
   test_all_rolling_maximum({1, 2, 3, 6, 5, 4, 7, 8, 9}, 3);
   test_all_rolling_maximum({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, 2);
   test_all_rolling_maximum(generate_input(1024), 2);
-  test_all_rolling_maximum(generate_input(1024), 2);
   test_all_rolling_maximum(generate_input(1024), 4);
   test_all_rolling_maximum(generate_input(1024), 64);
-  test_all_rolling_maximum(generate_input(16384), 2);
+  test_all_rolling_maximum(generate_iota(4096, 1), 2);
+  test_all_rolling_maximum(generate_input(16384 * 16), 2);
 
   //NVBENCH_MAIN_BODY(argc, argv);
 }
