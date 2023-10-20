@@ -54,8 +54,22 @@ struct rolling_maximum_thrust_max_element_t {
     return out_vector;
   }
 };
-constexpr rolling_maximum_thrust_max_element_t rolling_maximum_thrust_max_element{};
 
+struct index_to_window {
+  __host__ __device__ int operator()(int i) const { return i / window_size; }
+  std::size_t const window_size;
+};
+
+struct pincer_maximum {
+  __host__ __device__
+  auto operator()(thrust::tuple<int, int> left, thrust::tuple<int, int> right) const {
+    constexpr thrust::maximum<int> mx{};
+    return thrust::make_tuple(mx(thrust::get<0>(left), thrust::get<0>(right)),
+                              mx(thrust::get<1>(left), thrust::get<1>(right)));
+  }
+};
+
+#if 0
 /*
 input      = [a, b, c, d, e, f, g, h, i]
 windowed   = [a, b, c] [d, e, f] [g, h, i]
@@ -68,40 +82,25 @@ max = M(PM[i + k - 1], SM[i])
     = [M(M(a,b,c), M(c,b,a)), M(d, M(c,b)),    M(M(d,e), c),    ..., M(M(g,h,i), M(i,h,g))]
 */
 
-struct index_to_window {
-  __host__ __device__ int operator()(int i) const { return i / window_size; }
-  std::size_t const window_size;
-};
-
 struct rolling_maximum_thrust_scan_t {
   auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
     thrust::counting_iterator<int> iota(0);
     thrust::transform_iterator window(iota, index_to_window{window_size});
 
-    thrust::universal_vector<int> prefix_max(input.size());
-    thrust::inclusive_scan_by_key(window, window + input.size(), input.begin(), prefix_max.begin(),
+    thrust::universal_vector<int> prefix(input.size());
+    thrust::inclusive_scan_by_key(window, window + input.size(), input.begin(), prefix.begin(),
                                   thrust::equal_to<int>{}, thrust::maximum<int>{});
 
-    thrust::universal_vector<int> suffix_max(input.size());
-    thrust::inclusive_scan_by_key(window, window + input.size(), input.rbegin(), suffix_max.rbegin(),
+    thrust::universal_vector<int> suffix(input.size());
+    thrust::inclusive_scan_by_key(window, window + input.size(), input.rbegin(), suffix.rbegin(),
                                   thrust::equal_to<int>{}, thrust::maximum<int>{});
 
-    thrust::transform(prefix_max.begin() + window_size - 1, prefix_max.end(),
-                      suffix_max.begin(), suffix_max.begin(),
+    thrust::transform(prefix.begin() + window_size - 1, prefix.end(),
+                      suffix.begin(), suffix.begin(),
                       thrust::maximum<int>{});
-    suffix_max.resize(input.size() - window_size + 1);
+    suffix.resize(input.size() - window_size + 1);
 
-    return suffix_max;
-  }
-};
-constexpr rolling_maximum_thrust_scan_t rolling_maximum_thrust_scan{};
-
-struct pincer_maximum {
-  __host__ __device__
-  auto operator()(thrust::tuple<int, int> left, thrust::tuple<int, int> right) const {
-    constexpr thrust::maximum<int> mx{};
-    return thrust::make_tuple(mx(thrust::get<0>(left), thrust::get<0>(right)),
-                              mx(thrust::get<1>(left), thrust::get<1>(right)));
+    return suffix;
   }
 };
 
@@ -112,28 +111,28 @@ struct rolling_maximum_thrust_single_scan_t {
 
     auto const pincer_input = thrust::make_zip_iterator(thrust::make_tuple(input.begin(), input.rbegin()));
 
-    thrust::universal_vector<int> prefix_max(input.size());
-    thrust::universal_vector<int> suffix_max(input.size());
-    auto const pincer_output = thrust::make_zip_iterator(thrust::make_tuple(prefix_max.begin(), suffix_max.rbegin()));
+    thrust::universal_vector<int> prefix(input.size());
+    thrust::universal_vector<int> suffix(input.size());
+    auto const pincer_output = thrust::make_zip_iterator(thrust::make_tuple(prefix.begin(), suffix.rbegin()));
 
     thrust::inclusive_scan_by_key(window, window + input.size(), pincer_input, pincer_output,
                                   thrust::equal_to<int>{}, pincer_maximum{});
 
-    thrust::transform(prefix_max.begin() + window_size - 1, prefix_max.end(),
-                      suffix_max.begin(), suffix_max.begin(),
+    thrust::transform(prefix.begin() + window_size - 1, prefix.end(),
+                      suffix.begin(), suffix.begin(),
                       thrust::maximum<int>{});
-    suffix_max.resize(input.size() - window_size + 1);
+    suffix.resize(input.size() - window_size + 1);
 
-    return suffix_max;
+    return suffix;
   }
 };
-constexpr rolling_maximum_thrust_single_scan_t rolling_maximum_thrust_single_scan{};
+#endif
 
 /*
 input      = [a, b, c, d, e, f, g, h, i]
 windowed   = [a, b, c] [d, e, f] [g, h, i]
 
-PM =                   [a] [d, M(d,e), M(d,e,f)] [g, M(g,h), M(g,h,i)]
+PM =                   [c] [d, M(d,e), M(d,e,f)] [g, M(g,h), M(g,h,i)]
 SM = [M(c,b,a), M(c,b), c] [M(f,e,d), M(f,e), f] [g]
 
 max = M(PM[i], SM[i])
@@ -146,26 +145,25 @@ struct rolling_maximum_thrust_scan_local_t {
     thrust::counting_iterator<int> iota(0);
     thrust::transform_iterator window(iota, index_to_window{window_size});
 
-    thrust::universal_vector<int> prefix_max(input.size() - window_size + 1);
+    thrust::universal_vector<int> prefix(input.size() - window_size + 1);
     thrust::inclusive_scan_by_key(window + window_size - 1, window + input.size(),
                                   input.begin() + window_size - 1,
-                                  prefix_max.begin(),
+                                  prefix.begin(),
                                   thrust::equal_to<int>{}, thrust::maximum<int>{});
 
-    thrust::universal_vector<int> suffix_max(input.size() - window_size + 1);
+    thrust::universal_vector<int> suffix(input.size() - window_size + 1);
     thrust::inclusive_scan_by_key(window + window_size - 1, window + input.size(),
                                   input.rbegin() + window_size - 1,
-                                  suffix_max.rbegin(),
+                                  suffix.rbegin(),
                                   thrust::equal_to<int>{}, thrust::maximum<int>{});
 
-    thrust::transform(prefix_max.begin(), prefix_max.end(),
-                      suffix_max.begin(), prefix_max.begin(),
+    thrust::transform(prefix.begin(), prefix.end(),
+                      suffix.begin(), prefix.begin(),
                       thrust::maximum<int>{});
 
-    return prefix_max;
+    return prefix;
   }
 };
-constexpr rolling_maximum_thrust_scan_local_t rolling_maximum_thrust_scan_local{};
 
 struct rolling_maximum_thrust_single_scan_local_t {
   auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
@@ -175,23 +173,66 @@ struct rolling_maximum_thrust_single_scan_local_t {
     auto const pincer_input = thrust::make_zip_iterator(
       thrust::make_tuple(input.begin() + window_size - 1, input.rbegin() + window_size - 1));
 
-    thrust::universal_vector<int> prefix_max(input.size() - window_size + 1);
-    thrust::universal_vector<int> suffix_max(input.size() - window_size + 1);
-    auto const pincer_output = thrust::make_zip_iterator(thrust::make_tuple(prefix_max.begin(), suffix_max.rbegin()));
+    thrust::universal_vector<int> prefix(input.size() - window_size + 1);
+    thrust::universal_vector<int> suffix(input.size() - window_size + 1);
+    auto const pincer_output = thrust::make_zip_iterator(thrust::make_tuple(prefix.begin(), suffix.rbegin()));
 
     thrust::inclusive_scan_by_key(window + window_size - 1, window + input.size(), pincer_input, pincer_output,
                                   thrust::equal_to<int>{}, pincer_maximum{});
 
-    thrust::transform(prefix_max.begin(), prefix_max.end(),
-                      suffix_max.begin(), suffix_max.begin(),
+    thrust::transform(prefix.begin(), prefix.end(),
+                      suffix.begin(), suffix.begin(),
                       thrust::maximum<int>{});
 
-    return suffix_max;
+    return suffix;
   }
 };
-constexpr rolling_maximum_thrust_single_scan_local_t rolling_maximum_thrust_single_scan_local{};
 
-struct rolling_maximum_thrust_single_pass_t {
+struct rolling_maximum_thrust_midpoint_t {
+  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
+    thrust::counting_iterator<int> iota(0);
+    thrust::transform_iterator window(iota, index_to_window{window_size});
+
+    std::size_t const N = input.size() - window_size + 1;
+
+    std::size_t const midpoint = N / 2;
+    std::size_t const reverse_midpoint = (N + 2 - 1) / 2;
+
+    thrust::universal_vector<int> output(N);
+
+    thrust::universal_vector<int> suffix(N);
+    thrust::inclusive_scan_by_key(window + window_size - 1, window + input.size(),
+                                  input.rbegin() + window_size - 1,
+                                  suffix.begin(),
+                                  thrust::equal_to<int>{}, thrust::maximum<int>{});
+
+    thrust::copy(suffix.begin(), suffix.begin() + reverse_midpoint,
+                 output.rbegin());
+
+    thrust::universal_vector<int> prefix(N);
+    thrust::inclusive_scan_by_key(window + window_size - 1, window + input.size(),
+                                  input.begin() + window_size - 1,
+                                  prefix.begin(),
+                                  thrust::equal_to<int>{}, thrust::maximum<int>{});
+
+    thrust::copy(prefix.begin(), prefix.begin() + midpoint,
+                 output.begin());
+
+    thrust::transform(prefix.begin() + midpoint, prefix.end(),
+                      output.begin() + midpoint,
+                      output.begin() + midpoint,
+                      thrust::maximum<int>{});
+
+    thrust::transform(output.rbegin() + reverse_midpoint, output.rend(),
+                      suffix.begin() + reverse_midpoint,
+                      output.rbegin() + reverse_midpoint,
+                      thrust::maximum<int>{});
+
+    return output;
+  }
+};
+
+struct rolling_maximum_thrust_midpoint_single_pass_t {
   auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
     std::size_t tmp_storage = 0;
     cub::DeviceRollingReduce::RollingReduce(
@@ -212,17 +253,29 @@ struct rolling_maximum_thrust_single_pass_t {
     return output;
   }
 };
-constexpr rolling_maximum_thrust_single_pass_t rolling_maximum_thrust_single_pass{};
 
-using algorithms = nvbench::type_list<
+using test_algorithms = nvbench::type_list<
 /*
   rolling_maximum_thrust_max_element_t,
   rolling_maximum_thrust_scan_t,
   rolling_maximum_thrust_single_scan_t,
   rolling_maximum_thrust_scan_local_t,
   rolling_maximum_thrust_single_scan_local_t,
+  rolling_maximum_thrust_midpoint_t,
 */
-  rolling_maximum_thrust_single_pass_t
+  rolling_maximum_thrust_midpoint_single_pass_t
+>;
+
+using benchmark_algorithms = nvbench::type_list<
+/*
+  rolling_maximum_thrust_max_element_t,
+  rolling_maximum_thrust_scan_t,
+  rolling_maximum_thrust_single_scan_t,
+  rolling_maximum_thrust_scan_local_t,
+  rolling_maximum_thrust_single_scan_local_t,
+  rolling_maximum_thrust_midpoint_t,
+*/
+  rolling_maximum_thrust_midpoint_single_pass_t
 >;
 
 template <typename F>
@@ -274,7 +327,7 @@ void test_all_rolling_maximum(nvbench::type_list<Algorithm, Tail...>,
 }
 
 void test_all_rolling_maximum(thrust::universal_vector<int> input, std::size_t window_size) {
-  test_all_rolling_maximum(algorithms{}, input, window_size);
+  test_all_rolling_maximum(test_algorithms{}, input, window_size);
 }
 
 auto generate_input(std::size_t problem_size) {
@@ -308,13 +361,16 @@ void benchmark_rolling_maximum(nvbench::state& state, nvbench::type_list<F>) {
   });
 }
 
-NVBENCH_BENCH_TYPES(benchmark_rolling_maximum, NVBENCH_TYPE_AXES(algorithms))
+NVBENCH_BENCH_TYPES(benchmark_rolling_maximum, NVBENCH_TYPE_AXES(benchmark_algorithms))
   .set_type_axes_names({"Algorithms"})
   .add_int64_axis("ProblemSize", {1024 * 1024 * 16})
   .add_int64_axis("WindowSize", {2, 3, 64, 512, 1024, 1024 * 16})
 ;
 
 int main(int argc, char const* const* argv) {
+  // TODO: Test windows that don't cleanly divide.
+  test_all_rolling_maximum({}, 1);
+  test_all_rolling_maximum({7}, 1);
   test_all_rolling_maximum({3, 8, 1, 2}, 2);
   test_all_rolling_maximum({1, 6, 3, 8, 9, 6, 5, 4, 3}, 3);
   test_all_rolling_maximum({1, 2, 3, 6, 5, 4, 7, 8, 9}, 3);

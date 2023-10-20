@@ -431,6 +431,185 @@ struct SynchronizingScanByKeyTileState<KeyT, ValueT, MemoryOrder, true>
 };
 
 /******************************************************************************
+ * Prefix call-back operator for coupling local block scan within a
+ * block-cooperative scan which defers updating tile status until after the
+ * scan.
+ ******************************************************************************/
+
+/**
+ * Stateful block-scan prefix functor.  Provides the the running prefix for
+ * the current tile by using the call-back warp to wait on on
+ * aggregates/prefixes from predecessor tiles to become available. Defers
+ * updating the tile status until explicitly told to after the scan.
+ *
+ * @tparam DelayConstructorT
+ *   Implementation detail, do not specify directly, requirements on the
+ *   content of this type are subject to breaking change.
+ */
+template <
+    typename    T,
+    typename    ScanOpT,
+    typename    ScanTileStateT,
+    int         LEGACY_PTX_ARCH = 0,
+    typename    DelayConstructorT = detail::default_delay_constructor_t<T>>
+struct LazyTilePrefixCallbackOp
+{
+    // Parameterized warp reduce
+    typedef WarpReduce<T, CUB_PTX_WARP_THREADS> WarpReduceT;
+
+    // Temporary storage type
+    struct _TempStorage
+    {
+        typename WarpReduceT::TempStorage   warp_reduce;
+        T                                   exclusive_prefix;
+        T                                   inclusive_prefix;
+        T                                   block_aggregate;
+    };
+
+    // Alias wrapper allowing temporary storage to be unioned
+    struct TempStorage : Uninitialized<_TempStorage> {};
+
+    // Type of status word
+    typedef typename ScanTileStateT::StatusWord StatusWord;
+
+    // Fields
+    _TempStorage&               temp_storage;       ///< Reference to a warp-reduction instance
+    ScanTileStateT&             tile_status;        ///< Interface to tile status
+    ScanOpT                     scan_op;            ///< Binary scan operator
+    int                         tile_idx;           ///< The current tile index
+    T                           exclusive_prefix;   ///< Exclusive prefix for the tile
+    T                           inclusive_prefix;   ///< Inclusive prefix for the tile
+
+    // Constructs prefix functor for a given tile index.
+    // Precondition: thread blocks processing all of the predecessor tiles were scheduled.
+    __device__ CUB_FORCE_INLINE LazyTilePrefixCallbackOp(ScanTileStateT &tile_status,
+                                                         TempStorage &temp_storage,
+                                                         ScanOpT scan_op,
+                                                         int tile_idx)
+        : temp_storage(temp_storage.Alias())
+        , tile_status(tile_status)
+        , scan_op(scan_op)
+        , tile_idx(tile_idx)
+    {}
+
+    // Computes the tile index and constructs prefix functor with it.
+    // Precondition: thread block per tile assignment.
+    __device__ CUB_FORCE_INLINE LazyTilePrefixCallbackOp(ScanTileStateT &tile_status,
+                                                         TempStorage &temp_storage,
+                                                         ScanOpT scan_op)
+        : LazyTilePrefixCallbackOp(tile_status, temp_storage, scan_op, blockIdx.x)
+    {}
+
+    // Block until all predecessors within the warp-wide window have non-invalid status
+    template <class DelayT = detail::default_delay_t<T>>
+    __device__ CUB_FORCE_INLINE
+    void ProcessWindow(
+        int         predecessor_idx,        ///< Preceding tile index to inspect
+        StatusWord  &predecessor_status,    ///< [out] Preceding tile status
+        T           &window_aggregate,      ///< [out] Relevant partial reduction from this window of preceding tiles
+        DelayT      delay = {})
+    {
+        T value;
+        tile_status.WaitForValid(predecessor_idx, predecessor_status, value, delay);
+
+        // Perform a segmented reduction to get the prefix for the current window.
+        // Use the swizzled scan operator because we are now scanning *down* towards thread0.
+
+        int tail_flag = (predecessor_status == StatusWord(SCAN_TILE_INCLUSIVE));
+        window_aggregate = WarpReduceT(temp_storage.warp_reduce).TailSegmentedReduce(
+            value,
+            tail_flag,
+            SwizzleScanOp<ScanOpT>(scan_op));
+    }
+
+    // BlockScan prefix callback functor (called by the first warp)
+    __device__ CUB_FORCE_INLINE
+    T operator()(T block_aggregate)
+    {
+        // Update our status with our tile-aggregate
+        if (threadIdx.x == 0)
+        {
+          detail::uninitialized_copy(&temp_storage.block_aggregate,
+                                     block_aggregate);
+        }
+
+        int         predecessor_idx = tile_idx - threadIdx.x - 1;
+        StatusWord  predecessor_status;
+        T           window_aggregate;
+
+        // Wait for the warp-wide window of predecessor tiles to become valid
+        DelayConstructorT construct_delay(tile_idx);
+        ProcessWindow(predecessor_idx, predecessor_status, window_aggregate, construct_delay());
+
+        // The exclusive tile prefix starts out as the current window aggregate
+        exclusive_prefix = window_aggregate;
+
+        // Keep sliding the window back until we come across a tile whose inclusive prefix is known
+        while (WARP_ALL((predecessor_status != StatusWord(SCAN_TILE_INCLUSIVE)), 0xffffffff))
+        {
+            predecessor_idx -= CUB_PTX_WARP_THREADS;
+
+            // Update exclusive tile prefix with the window prefix
+            ProcessWindow(predecessor_idx, predecessor_status, window_aggregate, construct_delay());
+            exclusive_prefix = scan_op(window_aggregate, exclusive_prefix);
+        }
+
+        // Compute the inclusive tile prefix and update the status for this tile
+        if (threadIdx.x == 0)
+        {
+            inclusive_prefix = scan_op(exclusive_prefix, block_aggregate);
+
+            detail::uninitialized_copy(&temp_storage.exclusive_prefix,
+                                       exclusive_prefix);
+
+            detail::uninitialized_copy(&temp_storage.inclusive_prefix,
+                                       inclusive_prefix);
+        }
+
+        // Return exclusive_prefix
+        return exclusive_prefix;
+    }
+
+    __device__ CUB_FORCE_INLINE
+    void PublishTileStatus()
+    {
+        // Finalize the status for this tile
+        if (threadIdx.x == 0)
+        {
+            tile_status.SetPartial(tile_idx, temp_storage.block_aggregate);
+            tile_status.SetInclusive(tile_idx, inclusive_prefix);
+        }
+    }
+
+    // Get the exclusive prefix stored in temporary storage
+    __device__ CUB_FORCE_INLINE
+    T GetExclusivePrefix()
+    {
+        return temp_storage.exclusive_prefix;
+    }
+
+    // Get the inclusive prefix stored in temporary storage
+    __device__ CUB_FORCE_INLINE
+    T GetInclusivePrefix()
+    {
+        return temp_storage.inclusive_prefix;
+    }
+
+    // Get the block aggregate stored in temporary storage
+    __device__ CUB_FORCE_INLINE
+    T GetBlockAggregate()
+    {
+        return temp_storage.block_aggregate;
+    }
+
+    __device__ CUB_FORCE_INLINE
+    int GetTileIdx() const
+    {
+        return tile_idx;
+    }
+};
+
+/******************************************************************************
  * Tuning policy types
  ******************************************************************************/
 
@@ -582,7 +761,7 @@ struct AgentRollingReduce
   using SuffixTileCallbackT =
     TilePrefixCallbackOp<SizeValuePairT, ReduceBySegmentOpT, SuffixScanTileStateT, 0, DelayConstructorT>;
   using PrefixTileCallbackT =
-    TilePrefixCallbackOp<SizeValuePairT, ReduceBySegmentOpT, PrefixScanTileStateT, 0, DelayConstructorT>;
+    LazyTilePrefixCallbackOp<SizeValuePairT, ReduceBySegmentOpT, PrefixScanTileStateT, 0, DelayConstructorT>;
 
   using BlockScanT = BlockScan<SizeValuePairT,
                                BLOCK_THREADS,
@@ -642,8 +821,6 @@ struct AgentRollingReduce
     {
       if (!IS_LAST_TILE)
       {
-        // TODO: Remove this debugging code.
-        //printf("ScanFirstTile, tile_aggregate: %d\n", tile_aggregate.value);
         tile_state.SetInclusive(0, tile_aggregate);
       }
 
@@ -667,15 +844,103 @@ struct AgentRollingReduce
   }
 
   //---------------------------------------------------------------------
-  // Zip utility methods
+  // Utility methods
   //---------------------------------------------------------------------
+
+  template <typename DestinationIterator>
+  __device__ CUB_FORCE_INLINE void
+  StoreBeforeMidpoint(AccumT (&thread_src)[ITEMS_PER_THREAD],
+                      DestinationIterator global_dst,
+                      OffsetT num_remaining,
+                      OffsetT midpoint,
+                      OffsetT tile_base)
+  {
+    #pragma unroll
+    for (int thread_item = 0; thread_item < ITEMS_PER_THREAD; thread_item++)
+    {
+      OffsetT const tile_item    = OffsetT(threadIdx.x * ITEMS_PER_THREAD) + thread_item;
+      OffsetT const global_item  = tile_item + tile_base;
+      bool const in_bounds       = tile_item < num_remaining;
+      bool const before_midpoint = global_item < midpoint;
+      if (in_bounds && before_midpoint)
+      {
+        global_dst[global_item] = thread_src[thread_item];
+      }
+    }
+  }
+
+  template <typename DestinationIterator>
+  __device__ CUB_FORCE_INLINE void
+  StoreAfterMidpoint(AccumT (&thread_src)[ITEMS_PER_THREAD],
+                     DestinationIterator global_dst,
+                     OffsetT num_remaining,
+                     OffsetT midpoint,
+                     OffsetT tile_base)
+  {
+    #pragma unroll
+    for (int thread_item = 0; thread_item < ITEMS_PER_THREAD; thread_item++)
+    {
+      OffsetT const tile_item   = OffsetT(threadIdx.x * ITEMS_PER_THREAD) + thread_item;
+      OffsetT const global_item = tile_item + tile_base;
+      bool const in_bounds      = tile_item < num_remaining;
+      bool const after_midpoint = global_item >= midpoint;
+      if (in_bounds && after_midpoint)
+      {
+        global_dst[global_item] = thread_src[thread_item];
+      }
+    }
+  }
+
+  template <typename SourceIterator>
+  __device__ CUB_FORCE_INLINE void
+  LoadAfterMidpoint(SourceIterator global_src,
+                    AccumT (&thread_dst)[ITEMS_PER_THREAD],
+                    OffsetT num_remaining,
+                    OffsetT midpoint,
+                    OffsetT tile_base)
+  {
+    #pragma unroll
+    for (int thread_item = 0; thread_item < ITEMS_PER_THREAD; thread_item++)
+    {
+      OffsetT const tile_item   = OffsetT(threadIdx.x * ITEMS_PER_THREAD) + thread_item;
+      OffsetT const global_item = tile_item + tile_base;
+      bool const in_bounds      = tile_item < num_remaining;
+      bool const after_midpoint = global_item >= midpoint;
+      if (in_bounds && after_midpoint)
+      {
+        thread_dst[thread_item] = global_src[global_item];
+      }
+    }
+  }
+
+  __device__ CUB_FORCE_INLINE void
+  FinalReduceAfterMidpoint(AccumT (&suffix)[ITEMS_PER_THREAD],
+                           AccumT (&prefix)[ITEMS_PER_THREAD],
+                           AccumT (&result)[ITEMS_PER_THREAD],
+                           OffsetT num_remaining,
+                           OffsetT midpoint,
+                           OffsetT tile_base)
+  {
+    #pragma unroll
+    for (int thread_item = 0; thread_item < ITEMS_PER_THREAD; thread_item++)
+    {
+      OffsetT const tile_item   = OffsetT(threadIdx.x * ITEMS_PER_THREAD) + thread_item;
+      OffsetT const global_item = tile_item + tile_base;
+      bool const in_bounds      = tile_item < num_remaining;
+      bool const after_midpoint = global_item >= midpoint;
+      if (in_bounds && after_midpoint)
+      {
+        result[thread_item] = reduce_op(suffix[thread_item], prefix[thread_item]);
+      }
+    }
+  }
 
   template <bool IS_LAST_TILE>
   __device__ CUB_FORCE_INLINE void
-  ZipValuesAndFlags(OffsetT num_remaining,
-                    AccumT  (&values)[ITEMS_PER_THREAD],
+  ZipValuesAndFlags(AccumT  (&values)[ITEMS_PER_THREAD],
                     OffsetT (&segment_flags)[ITEMS_PER_THREAD],
-                    SizeValuePairT (&scan_items)[ITEMS_PER_THREAD])
+                    SizeValuePairT (&scan_items)[ITEMS_PER_THREAD],
+                    OffsetT num_remaining)
   {
     // Zip values and segment_flags
     #pragma unroll
@@ -697,7 +962,6 @@ struct AgentRollingReduce
   UnzipValues(AccumT         (&values)[ITEMS_PER_THREAD],
               SizeValuePairT (&scan_items)[ITEMS_PER_THREAD])
   {
-    // Unzip values and segment_flags
     #pragma unroll
     for (int ITEM = 0; ITEM < ITEMS_PER_THREAD; ++ITEM)
     {
@@ -705,34 +969,27 @@ struct AgentRollingReduce
     }
   }
 
-  __device__ CUB_FORCE_INLINE void
-  FinalReduce(AccumT (&suffix)[ITEMS_PER_THREAD],
-              AccumT (&prefix)[ITEMS_PER_THREAD],
-              AccumT (&final)[ITEMS_PER_THREAD])
-  {
-    #pragma unroll
-    for (int ITEM = 0; ITEM < ITEMS_PER_THREAD; ++ITEM)
-    {
-      // TODO: Remove this debugging code.
-      //if (blockIdx.x == 0 && threadIdx.x == 0)
-      //  printf("FinalReduce, thread: 0, item: %d, suffix: %d, prefix: %d\n", ITEM, suffix[ITEM], prefix[ITEM]);
-      final[ITEM] = reduce_op(suffix[ITEM], prefix[ITEM]);
-    }
-  }
-
   //---------------------------------------------------------------------
   // Cooperatively scan a device-wide sequence of tiles with other CTAs
   //---------------------------------------------------------------------
 
+  // TODO: Distinguish between pre-midpoint, midpoint, and post-midpoint tiles
+  // at compile time.
+
   // Process a tile of input (dynamic chained scan)
   template <bool IS_LAST_TILE>
-  __device__ CUB_FORCE_INLINE void ConsumeTile(OffsetT /*num_items*/,
+  __device__ CUB_FORCE_INLINE void ConsumeTile(OffsetT num_items,
                                                OffsetT num_remaining,
                                                int tile_idx,
                                                OffsetT tile_base,
                                                SuffixScanTileStateT &suffix_tile_state,
                                                PrefixScanTileStateT &prefix_tile_state)
   {
+    OffsetT const midpoint         = num_items <= 1 ? 0
+                                   : num_items / 2;
+    OffsetT const reverse_midpoint = num_items <= 1 ? 0
+                                   : (num_items + 2 - 1) / 2;
+
     ///////////////////////////////////////////////////////////////////////////
     // Load items
 
@@ -793,10 +1050,10 @@ struct AgentRollingReduce
       BlockDiscontinuityKeysT(storage.scan_storage.discontinuity)
         .FlagHeads(segment_flags, keys, inequality_op);
 
-      ZipValuesAndFlags<IS_LAST_TILE>(num_remaining,
-                                      suffix,
+      ZipValuesAndFlags<IS_LAST_TILE>(suffix,
                                       segment_flags,
-                                      scan_items);
+                                      scan_items,
+                                      num_remaining);
 
       ScanFirstTile<IS_LAST_TILE>(scan_items, suffix_tile_state);
     }
@@ -808,10 +1065,10 @@ struct AgentRollingReduce
       BlockDiscontinuityKeysT(storage.scan_storage.discontinuity)
         .FlagHeads(segment_flags, keys, inequality_op, tile_pred_key);
 
-      ZipValuesAndFlags<IS_LAST_TILE>(num_remaining,
-                                      suffix,
+      ZipValuesAndFlags<IS_LAST_TILE>(suffix,
                                       segment_flags,
-                                      scan_items);
+                                      scan_items,
+                                      num_remaining);
 
       SuffixTileCallbackT lookback_op(suffix_tile_state,
                                       storage.scan_storage.suffix_lookback,
@@ -825,94 +1082,115 @@ struct AgentRollingReduce
     UnzipValues(suffix, scan_items);
 
     ///////////////////////////////////////////////////////////////////////////
-    // Store suffix scan reversed in output
+    // Store suffix scan before midpoint reversed in output
 
-    if (IS_LAST_TILE)
-    {
-      BlockStoreValuesT(storage.store_values)
-        .Store(d_reverse_out + tile_base, suffix, num_remaining);
-    }
-    else
-    {
-      BlockStoreValuesT(storage.store_values)
-        .Store(d_reverse_out + tile_base, suffix);
-    }
-
-    cuda::atomic_thread_fence(cuda::memory_order_release,
-                              cuda::thread_scope_device);
+    StoreBeforeMidpoint(suffix,
+                        d_reverse_out,
+                        num_remaining, reverse_midpoint, tile_base);
 
     CTA_SYNC();
 
     ///////////////////////////////////////////////////////////////////////////
-    // Suffix scan with acquire/release semantics. This ensures that the store
+    // Prefix scan with acquire/release semantics. This ensures that the store
     // of the suffix scan to the input will be visible after the prefix scan.
+
+    SizeValuePairT tile_aggregate;
+
+    PrefixTileCallbackT lookback_op(prefix_tile_state,
+                                    storage.scan_storage.prefix_lookback,
+                                    pair_reduce_op,
+                                    tile_idx);
 
     if (tile_idx == 0) // First tile
     {
-      ZipValuesAndFlags<IS_LAST_TILE>(num_remaining,
-                                      prefix,
+      ZipValuesAndFlags<IS_LAST_TILE>(prefix,
                                       segment_flags,
-                                      scan_items);
+                                      scan_items,
+                                      num_remaining);
 
-      ScanFirstTile<IS_LAST_TILE>(scan_items, prefix_tile_state);
+      BlockScanT(storage.scan_storage.scan)
+        .InclusiveScan(scan_items, scan_items, pair_reduce_op, tile_aggregate);
     }
     else
     {
-      ZipValuesAndFlags<IS_LAST_TILE>(num_remaining,
-                                      prefix,
+      ZipValuesAndFlags<IS_LAST_TILE>(prefix,
                                       segment_flags,
-                                      scan_items);
+                                      scan_items,
+                                      num_remaining);
 
-      PrefixTileCallbackT lookback_op(prefix_tile_state,
-                                      storage.scan_storage.prefix_lookback,
-                                      pair_reduce_op,
-                                      tile_idx);
       ScanSubsequentTile<IS_LAST_TILE>(scan_items, lookback_op);
     }
-
-    CTA_SYNC();
 
     UnzipValues(prefix, scan_items);
 
     ///////////////////////////////////////////////////////////////////////////
-    // Load suffix scan from output
+    // Store prefix scan before midpoint in output
 
-    if (IS_LAST_TILE)
+    StoreBeforeMidpoint(prefix,
+                        d_out,
+                        num_remaining, midpoint, tile_base);
+
+    cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_device);
+
+    CTA_SYNC();
+
+    ///////////////////////////////////////////////////////////////////////////
+    // Publish prefix scan
+
+    if (tile_idx == 0) // First tile
     {
-      // Fill last element with the first element because collectives are not guarded
-      BlockLoadValuesT(storage.load_suffix)
-        .Load(d_out + tile_base,
-              suffix,
-              num_remaining,
-              *(d_out + tile_base));
+      if (threadIdx.x == 0)
+      {
+        if (!IS_LAST_TILE)
+        {
+          prefix_tile_state.SetInclusive(0, tile_aggregate);
+        }
+
+        scan_items[0].key = 0;
+      }
     }
     else
     {
-      BlockLoadValuesT(storage.load_suffix)
-        .Load(d_out + tile_base, suffix);
+      lookback_op.PublishTileStatus();
     }
 
     CTA_SYNC();
 
     ///////////////////////////////////////////////////////////////////////////
-    // Compute the final results using the prefix and suffix scans
+    // Load tail from global output
 
-    AccumT final[ITEMS_PER_THREAD];
-    FinalReduce(suffix, prefix, final);
+    AccumT lookback[ITEMS_PER_THREAD];
+
+    LoadAfterMidpoint(d_out,
+                      lookback,
+                      num_remaining, midpoint, tile_base);
 
     ///////////////////////////////////////////////////////////////////////////
-    // Store final result
+    // Tail reduction
 
-    if (IS_LAST_TILE)
-    {
-      BlockStoreValuesT(storage.store_values)
-        .Store(d_out + tile_base, final, num_remaining);
-    }
-    else
-    {
-      BlockStoreValuesT(storage.store_values)
-        .Store(d_out + tile_base, final);
-    }
+    FinalReduceAfterMidpoint(prefix, lookback, lookback,
+                             num_remaining, midpoint, tile_base);
+
+    StoreAfterMidpoint(lookback,
+                       d_out,
+                       num_remaining, midpoint, tile_base);
+
+    ///////////////////////////////////////////////////////////////////////////
+    // Load head from global output
+
+    LoadAfterMidpoint(d_reverse_out,
+                      lookback,
+                      num_remaining, reverse_midpoint, tile_base);
+
+    ///////////////////////////////////////////////////////////////////////////
+    // Head reduction
+
+    FinalReduceAfterMidpoint(lookback, suffix, lookback,
+                             num_remaining, reverse_midpoint, tile_base);
+
+    StoreAfterMidpoint(lookback,
+                       d_reverse_out,
+                       num_remaining, reverse_midpoint, tile_base);
   }
 
   //---------------------------------------------------------------------
