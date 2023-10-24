@@ -66,6 +66,7 @@ template <typename ChainedPolicyT,
           typename PrefixTileStateT,
           typename ReductionOpT,
           typename OffsetT,
+          typename WindowSizeT,
           typename AccumT,
           typename KeyT = cub::detail::value_t<KeysInputIteratorT>>
 __launch_bounds__(int(ChainedPolicyT::ActivePolicy::ScanByKeyPolicyT::BLOCK_THREADS))
@@ -79,7 +80,8 @@ CUB_DETAIL_KERNEL_ATTRIBUTES void DeviceRollingReduceKernel(KeysInputIteratorT d
                                                             PrefixTileStateT prefix_tile_state,
                                                             int start_tile,
                                                             ReductionOpT reduction_op,
-                                                            OffsetT num_items)
+                                                            OffsetT num_items,
+                                                            WindowSizeT window_size)
 {
   using RollingReducePolicyT =
     typename ChainedPolicyT::ActivePolicy::ScanByKeyPolicyT;
@@ -90,6 +92,7 @@ CUB_DETAIL_KERNEL_ATTRIBUTES void DeviceRollingReduceKernel(KeysInputIteratorT d
                                                  OutputIteratorT,
                                                  ReductionOpT,
                                                  OffsetT,
+                                                 WindowSizeT,
                                                  AccumT>;
 
   // Shared memory for AgentRollingReduce
@@ -145,13 +148,14 @@ template <
   typename OutputIteratorT,
   typename ReductionOpT,
   typename OffsetT,
+  typename WindowSizeT,
   typename AccumT =
     detail::accumulator_t<ReductionOpT,
                           cub::detail::value_t<InputIteratorT>,
                           cub::detail::value_t<InputIteratorT>>,
   // TODO: We should do our own tuning.
   typename SelectedPolicy = DeviceScanByKeyPolicy<
-    thrust::transform_iterator<IndexToWindow<OffsetT>, thrust::counting_iterator<OffsetT>>,
+    thrust::transform_iterator<IndexToWindow<OffsetT, WindowSizeT>, thrust::counting_iterator<OffsetT>>,
     AccumT,
     InputIteratorT,
     ReductionOpT>>
@@ -164,7 +168,7 @@ struct DispatchRollingReduce : SelectedPolicy
   static constexpr int INIT_KERNEL_THREADS = 128;
 
   using KeysInputIteratorT     = thrust::transform_iterator<
-    IndexToWindow<OffsetT>, thrust::counting_iterator<OffsetT>>;
+    IndexToWindow<OffsetT, WindowSizeT>, thrust::counting_iterator<OffsetT>>;
   using ReverseInputIteratorT  = thrust::reverse_iterator<InputIteratorT>;
   using ReverseOutputIteratorT = thrust::reverse_iterator<OutputIteratorT>;
 
@@ -200,8 +204,8 @@ struct DispatchRollingReduce : SelectedPolicy
   /// Total number of input items (i.e., the length of `d_in`)
   OffsetT num_items;
 
-  /// Rolling window size
-  OffsetT window_size;
+  /// Size of the rolling window.
+  WindowSizeT window_size;
 
   /// CUDA stream to launch kernels within.
   cudaStream_t stream;
@@ -214,13 +218,13 @@ struct DispatchRollingReduce : SelectedPolicy
                         OutputIteratorT d_out,
                         ReductionOpT reduction_op,
                         OffsetT num_items,
-                        OffsetT window_size,
+                        WindowSizeT window_size,
                         cudaStream_t stream,
                         int ptx_version)
       : d_temp_storage(d_temp_storage)
       , temp_storage_bytes(temp_storage_bytes)
       , d_keys_in(thrust::make_transform_iterator(
-          thrust::counting_iterator<OffsetT>(0), IndexToWindow(window_size)) + window_size - 1)
+          thrust::counting_iterator<OffsetT>(0), IndexToWindow<OffsetT, WindowSizeT>{window_size}) + window_size - 1)
       , d_in(d_in + window_size - 1)
       , d_reverse_in(thrust::make_reverse_iterator(d_in + num_items) + window_size - 1)
       , d_out(d_out)
@@ -240,7 +244,7 @@ struct DispatchRollingReduce : SelectedPolicy
                         OutputIteratorT d_out,
                         ReductionOpT reduction_op,
                         OffsetT num_items,
-                        OffsetT window_size,
+                        WindowSizeT window_size,
                         cudaStream_t stream,
                         bool debug_synchronous,
                         int ptx_version)
@@ -418,7 +422,8 @@ struct DispatchRollingReduce : SelectedPolicy
                 prefix_tile_state,
                 start_tile,
                 reduction_op,
-                num_items);
+                num_items,
+                window_size);
 
         // Check for failure to launch
         error = CubDebug(cudaPeekAtLastError());
@@ -463,6 +468,7 @@ struct DispatchRollingReduce : SelectedPolicy
                                 RollingReducePrefixTileStateT,
                                 ReductionOpT,
                                 OffsetT,
+                                WindowSizeT,
                                 AccumT>);
   }
 
@@ -473,7 +479,7 @@ struct DispatchRollingReduce : SelectedPolicy
            OutputIteratorT d_out,
            ReductionOpT reduction_op,
            OffsetT num_items,
-           OffsetT window_size,
+           WindowSizeT window_size,
            cudaStream_t stream)
   {
     using MaxPolicyT = typename DispatchRollingReduce::MaxPolicy;
@@ -520,7 +526,7 @@ struct DispatchRollingReduce : SelectedPolicy
            OutputIteratorT d_out,
            ReductionOpT reduction_op,
            OffsetT num_items,
-           OffsetT window_size,
+           WindowSizeT window_size,
            cudaStream_t stream,
            bool debug_synchronous)
   {

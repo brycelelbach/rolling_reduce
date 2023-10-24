@@ -649,7 +649,7 @@ struct AgentRollingReducePolicy
  * Function objects
  ******************************************************************************/
 
-template <typename OffsetT>
+template <typename OffsetT, typename WindowSizeT>
 struct IndexToWindow
 {
   __host__ __device__ OffsetT
@@ -657,9 +657,7 @@ struct IndexToWindow
   {
     return i / window_size;
   }
-
-  // TODO: Pass this as a compile time parameter?
-  OffsetT const window_size;
+  WindowSizeT const window_size;
 };
 
 /******************************************************************************
@@ -693,6 +691,7 @@ template <typename AgentRollingReducePolicyT,
           typename OutputIteratorT,
           typename ReductionOpT,
           typename OffsetT,
+          typename WindowSizeT,
           typename AccumT>
 struct AgentRollingReduce
 {
@@ -701,7 +700,7 @@ struct AgentRollingReduce
   //---------------------------------------------------------------------
 
   using KeysInputIteratorT     = thrust::transform_iterator<
-    IndexToWindow<OffsetT>, thrust::counting_iterator<OffsetT>>;
+    IndexToWindow<OffsetT, WindowSizeT>, thrust::counting_iterator<OffsetT>>;
   using ReverseInputIteratorT  = thrust::reverse_iterator<InputIteratorT>;
   using ReverseOutputIteratorT = thrust::reverse_iterator<OutputIteratorT>;
 

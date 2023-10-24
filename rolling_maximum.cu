@@ -20,7 +20,9 @@
 #include <nvbench/nvbench.cuh>
 #include <nvbench/main.cuh>
 
-auto rolling_maximum_ranges_cpp20(thrust::universal_vector<int> input, std::size_t window_size) {
+template <typename WindowSizeT>
+auto rolling_maximum_ranges_cpp20(thrust::universal_vector<int> input,
+                                  WindowSizeT window_size) {
   auto const output_size = input.size() - window_size + 1;
   thrust::universal_vector<int> out_vector;
   out_vector.reserve(output_size);
@@ -31,17 +33,19 @@ auto rolling_maximum_ranges_cpp20(thrust::universal_vector<int> input, std::size
   return out_vector;
 }
 
+template <typename WindowSizeT>
 struct local_maximum {
   __host__ __device__
   auto operator()(int idx) const {
     return *thrust::max_element(thrust::seq, input + idx, input + idx + window_size);
   }
   int* const input;
-  std::size_t const window_size;
+  WindowSizeT const window_size;
 };
 
 struct rolling_maximum_thrust_max_element_t {
-  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
+  template <typename WindowSizeT>
+  auto operator()(thrust::universal_vector<int> input, WindowSizeT window_size) const {
     auto const output_size = input.size() - window_size + 1;
     thrust::universal_vector<int> out_vector(output_size);
 
@@ -49,15 +53,16 @@ struct rolling_maximum_thrust_max_element_t {
     thrust::counting_iterator<int> iota_end(output_size);
 
     thrust::transform(iota_begin, iota_end, out_vector.begin(),
-      local_maximum{thrust::raw_pointer_cast(input.data()), window_size});
+      local_maximum<WindowSizeT>{thrust::raw_pointer_cast(input.data()), window_size});
 
     return out_vector;
   }
 };
 
+template <typename WindowSizeT>
 struct index_to_window {
-  __host__ __device__ int operator()(int i) const { return i / window_size; }
-  std::size_t const window_size;
+  __host__ __device__ auto operator()(int i) const { return i / window_size; }
+  WindowSizeT const window_size;
 };
 
 struct pincer_maximum {
@@ -82,9 +87,10 @@ max = M(PM[i], SM[i])
 */
 
 struct rolling_maximum_thrust_scan_t {
-  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
+  template <typename WindowSizeT>
+  auto operator()(thrust::universal_vector<int> input, WindowSizeT window_size) const {
     thrust::counting_iterator<int> iota(0);
-    thrust::transform_iterator window(iota, index_to_window{window_size});
+    thrust::transform_iterator window(iota, index_to_window<WindowSizeT>{window_size});
 
     thrust::universal_vector<int> prefix(input.size() - window_size + 1);
     thrust::inclusive_scan_by_key(window + window_size - 1, window + input.size(),
@@ -107,9 +113,10 @@ struct rolling_maximum_thrust_scan_t {
 };
 
 struct rolling_maximum_thrust_single_scan_t {
-  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
+  template <typename WindowSizeT>
+  auto operator()(thrust::universal_vector<int> input, WindowSizeT window_size) const {
     auto const iota = thrust::make_counting_iterator(0);
-    auto const window = thrust::make_transform_iterator(iota, index_to_window{window_size});
+    auto const window = thrust::make_transform_iterator(iota, index_to_window<WindowSizeT>{window_size});
 
     auto const pincer_input = thrust::make_zip_iterator(
       thrust::make_tuple(input.begin() + window_size - 1, input.rbegin() + window_size - 1));
@@ -130,9 +137,11 @@ struct rolling_maximum_thrust_single_scan_t {
 };
 
 struct rolling_maximum_thrust_midpoint_scan_t {
-  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
+  template <typename WindowSizeT>
+  auto operator()(thrust::universal_vector<int> input, WindowSizeT window_size) const {
     thrust::counting_iterator<int> iota(0);
-    thrust::transform_iterator window(iota, index_to_window{window_size});
+    thrust::transform_iterator window(iota, index_to_window<WindowSizeT>{window_size});
+
 
     std::size_t const N = input.size() - window_size + 1;
 
@@ -174,7 +183,8 @@ struct rolling_maximum_thrust_midpoint_scan_t {
 };
 
 struct rolling_maximum_thrust_midpoint_scan_single_pass_t {
-  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
+  template <typename WindowSizeT>
+  auto operator()(thrust::universal_vector<int> input, WindowSizeT window_size) const {
     std::size_t tmp_storage = 0;
     cub::DeviceRollingReduce::RollingReduce(
       NULL, tmp_storage, input.begin(), input.begin(),
@@ -196,7 +206,8 @@ struct rolling_maximum_thrust_midpoint_scan_single_pass_t {
 };
 
 struct rolling_maximum_thrust_midpoint_scan_single_pass_inplace_t {
-  auto operator()(thrust::universal_vector<int> input, std::size_t window_size) const {
+  template <typename WindowSizeT>
+  auto operator()(thrust::universal_vector<int> input, WindowSizeT window_size) const {
     std::size_t tmp_storage = 0;
     cub::DeviceRollingReduce::RollingReduce(
       NULL, tmp_storage, input.begin(), input.begin(),
@@ -217,37 +228,20 @@ struct rolling_maximum_thrust_midpoint_scan_single_pass_inplace_t {
   }
 };
 
-using test_algorithms = nvbench::type_list<
-  rolling_maximum_thrust_max_element_t,
-  rolling_maximum_thrust_scan_t,
-  rolling_maximum_thrust_single_scan_t,
-  rolling_maximum_thrust_midpoint_scan_t,
-  rolling_maximum_thrust_midpoint_scan_single_pass_t,
-  rolling_maximum_thrust_midpoint_scan_single_pass_inplace_t
->;
-
-using benchmark_algorithms = nvbench::type_list<
-  rolling_maximum_thrust_max_element_t,
-  rolling_maximum_thrust_scan_t,
-  rolling_maximum_thrust_single_scan_t,
-  rolling_maximum_thrust_midpoint_scan_single_pass_t,
-  rolling_maximum_thrust_midpoint_scan_single_pass_inplace_t
->;
-
-template <typename F>
-void debug_rolling_maximum(F f, thrust::universal_vector<int>& input, std::size_t window_size) {
+template <typename WindowSizeT, typename F>
+void debug_rolling_maximum(F f, thrust::universal_vector<int>& input, WindowSizeT window_size) {
   for (auto&& i: f(input, window_size))
     std::cout << i << " ";
   std::cout << "\n";
 }
 
-template <typename F>
-void test_rolling_maximum(F f, thrust::universal_vector<int>& input, std::size_t window_size) {
+template <typename WindowSizeT, typename F>
+void test_rolling_maximum(F f, thrust::universal_vector<int>& input, WindowSizeT window_size) {
   auto gold = rolling_maximum_ranges_cpp20(input, window_size);
   auto output = f(input, window_size);
   if (gold.size() != output.size() || !thrust::equal(gold.begin(), gold.end(), output.begin())) {
     std::cout << "Test failed, input size: " << input.size()
-              << ", window size: " << window_size << "\n";
+              << ", window size: " << window_size.value << "\n";
 
     if (input.size() < 1024) {
       std::cout << "input:  ";
@@ -274,16 +268,13 @@ void test_rolling_maximum(F f, thrust::universal_vector<int>& input, std::size_t
   }
 }
 
-template <typename Algorithm, typename... Tail>
+template <typename WindowSizeT, typename Algorithm, typename... Tail>
 void test_all_rolling_maximum(nvbench::type_list<Algorithm, Tail...>,
-                              thrust::universal_vector<int>& input, std::size_t window_size) {
+                              thrust::universal_vector<int>& input,
+                              WindowSizeT window_size) {
   test_rolling_maximum(Algorithm{}, input, window_size);
   if constexpr (sizeof...(Tail) > 0)
     test_all_rolling_maximum(nvbench::type_list<Tail...>{}, input, window_size);
-}
-
-void test_all_rolling_maximum(thrust::universal_vector<int> input, std::size_t window_size) {
-  test_all_rolling_maximum(test_algorithms{}, input, window_size);
 }
 
 auto generate_input(std::size_t problem_size) {
@@ -302,10 +293,10 @@ auto generate_iota(std::size_t problem_size, int init) {
   return std::move(input);
 }
 
-template <typename F>
-void benchmark_rolling_maximum(nvbench::state& state, nvbench::type_list<F>) {
+template <typename F, typename WindowSizeT>
+void benchmark_rolling_maximum(nvbench::state& state,
+                               nvbench::type_list<F, WindowSizeT>) {
   std::size_t const problem_size = state.get_int64("ProblemSize");
-  std::size_t const window_size  = state.get_int64("WindowSize");
 
   auto input = generate_input(problem_size);
 
@@ -313,29 +304,63 @@ void benchmark_rolling_maximum(nvbench::state& state, nvbench::type_list<F>) {
   state.set_cuda_stream(nvbench::make_cuda_stream_view(default_stream));
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
-    F{}(input, window_size);
+    F{}(input, WindowSizeT{});
   });
 }
 
-NVBENCH_BENCH_TYPES(benchmark_rolling_maximum, NVBENCH_TYPE_AXES(benchmark_algorithms))
-  .set_type_axes_names({"Algorithms"})
+template <int WindowSize>
+using window_size_t = cub::StaticWindowSize<int, WindowSize>;
+
+using test_algorithms = nvbench::type_list<
+  rolling_maximum_thrust_max_element_t,
+  rolling_maximum_thrust_scan_t,
+  rolling_maximum_thrust_single_scan_t,
+  rolling_maximum_thrust_midpoint_scan_t,
+  rolling_maximum_thrust_midpoint_scan_single_pass_t,
+  rolling_maximum_thrust_midpoint_scan_single_pass_inplace_t
+>;
+
+using benchmark_algorithms = nvbench::type_list<
+  rolling_maximum_thrust_max_element_t,
+  rolling_maximum_thrust_scan_t,
+  rolling_maximum_thrust_single_scan_t,
+  rolling_maximum_thrust_midpoint_scan_single_pass_t,
+  rolling_maximum_thrust_midpoint_scan_single_pass_inplace_t
+>;
+
+using window_sizes = nvbench::type_list<
+  window_size_t<2>,
+  window_size_t<3>,
+  window_size_t<64>,
+  window_size_t<512>,
+  window_size_t<1024>,
+  window_size_t<16384>
+>;
+
+template <typename WindowSizeT>
+void test_all_rolling_maximum(thrust::universal_vector<int> input,
+                              WindowSizeT window_size) {
+  test_all_rolling_maximum(test_algorithms{}, input, window_size);
+}
+
+NVBENCH_BENCH_TYPES(benchmark_rolling_maximum, NVBENCH_TYPE_AXES(benchmark_algorithms, window_sizes))
+  .set_type_axes_names({"Algorithm", "WindowSize"})
   .add_int64_axis("ProblemSize", {1024 * 1024 * 16})
-  .add_int64_axis("WindowSize", {2, 3, 64, 512, 1024, 1024 * 16})
 ;
 
 int main(int argc, char const* const* argv) {
   // TODO: Test windows that don't cleanly divide.
-  test_all_rolling_maximum({}, 1);
-  test_all_rolling_maximum({7}, 1);
-  test_all_rolling_maximum({3, 8, 1, 2}, 2);
-  test_all_rolling_maximum({1, 6, 3, 8, 9, 6, 5, 4, 3}, 3);
-  test_all_rolling_maximum({1, 2, 3, 6, 5, 4, 7, 8, 9}, 3);
-  test_all_rolling_maximum({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, 2);
-  test_all_rolling_maximum(generate_input(1024), 2);
-  test_all_rolling_maximum(generate_input(1024), 4);
-  test_all_rolling_maximum(generate_input(1024), 64);
-  test_all_rolling_maximum(generate_iota(4096, 1), 2);
-  test_all_rolling_maximum(generate_input(16384 * 16), 2);
+  test_all_rolling_maximum({}, window_size_t<1>{});
+  test_all_rolling_maximum({7}, window_size_t<1>{});
+  test_all_rolling_maximum({3, 8, 1, 2}, window_size_t<2>{});
+  test_all_rolling_maximum({1, 6, 3, 8, 9, 6, 5, 4, 3}, window_size_t<3>());
+  test_all_rolling_maximum({1, 2, 3, 6, 5, 4, 7, 8, 9}, window_size_t<3>());
+  test_all_rolling_maximum({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, window_size_t<2>());
+  test_all_rolling_maximum(generate_input(1024), window_size_t<2>());
+  test_all_rolling_maximum(generate_input(1024), window_size_t<4>());
+  test_all_rolling_maximum(generate_input(1024), window_size_t<64>());
+  test_all_rolling_maximum(generate_iota(4096, 1), window_size_t<2>());
+  test_all_rolling_maximum(generate_input(16384 * 16), window_size_t<2>());
 
   NVBENCH_MAIN_BODY(argc, argv);
 }

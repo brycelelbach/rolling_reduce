@@ -39,13 +39,19 @@
 #include <cub/thread/thread_operators.cuh>
 #include <cub/util_deprecated.cuh>
 
+#include <cuda/std/type_traits>
+
 CUB_NAMESPACE_BEGIN
+
+template <typename OffsetT, OffsetT K>
+using StaticWindowSize = cuda::std::integral_constant<OffsetT, K>;
 
 struct DeviceRollingReduce
 {
   template <typename InputIteratorT,
             typename OutputIteratorT,
-            typename ReductionOpT>
+            typename ReductionOpT,
+            typename WindowSizeT>
   CUB_RUNTIME_FUNCTION static cudaError_t
   RollingReduce(void *d_temp_storage,
                 size_t &temp_storage_bytes,
@@ -53,7 +59,7 @@ struct DeviceRollingReduce
                 OutputIteratorT d_out,
                 ReductionOpT reduction_op,
                 int num_items,
-                int window_size,
+                WindowSizeT window_size,
                 cudaStream_t stream = 0)
   {
       // Signed integer type for global offsets
@@ -62,19 +68,21 @@ struct DeviceRollingReduce
       return DispatchRollingReduce<InputIteratorT,
                                    OutputIteratorT,
                                    ReductionOpT,
-                                   OffsetT>::Dispatch(d_temp_storage,
-                                                      temp_storage_bytes,
-                                                      d_in,
-                                                      d_out,
-                                                      reduction_op,
-                                                      num_items,
-                                                      window_size,
-                                                      stream);
+                                   OffsetT,
+                                   WindowSizeT>::Dispatch(d_temp_storage,
+                                                          temp_storage_bytes,
+                                                          d_in,
+                                                          d_out,
+                                                          reduction_op,
+                                                          num_items,
+                                                          window_size,
+                                                          stream);
   }
 
   template <typename InputIteratorT,
             typename OutputIteratorT,
-            typename ReductionOpT>
+            typename ReductionOpT,
+            typename WindowSizeT>
   CUB_DETAIL_RUNTIME_DEBUG_SYNC_IS_NOT_SUPPORTED
   CUB_RUNTIME_FUNCTION static cudaError_t
   RollingReduce(void *d_temp_storage,
@@ -83,7 +91,7 @@ struct DeviceRollingReduce
                 OutputIteratorT d_out,
                 ReductionOpT reduction_op,
                 int num_items,
-                int window_size,
+                WindowSizeT window_size,
                 cudaStream_t stream,
                 bool debug_synchronous)
   {
@@ -91,18 +99,17 @@ struct DeviceRollingReduce
 
     return RollingReduce<InputIteratorT,
                          OutputIteratorT,
-                         ReductionOpT>(d_temp_storage,
-                                       temp_storage_bytes,
-                                       d_in,
-                                       d_out,
-                                       reduction_op,
-                                       num_items,
-                                       window_size,
-                                       stream);
+                         ReductionOpT,
+                         WindowSizeT>(d_temp_storage,
+                                      temp_storage_bytes,
+                                      d_in,
+                                      d_out,
+                                      reduction_op,
+                                      num_items,
+                                      stream);
   }
 
 };
 
 CUB_NAMESPACE_END
-
 
