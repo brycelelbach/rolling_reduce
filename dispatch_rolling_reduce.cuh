@@ -34,6 +34,7 @@
 
 #include <cub/config.cuh>
 #include "agent_rolling_reduce.cuh"
+#include "tuning_rolling_reduce.cuh"
 #include <cub/device/dispatch/dispatch_scan_by_key.cuh>
 #include <cub/device/dispatch/tuning/tuning_scan_by_key.cuh>
 #include <cub/thread/thread_operators.cuh>
@@ -153,8 +154,7 @@ template <
     detail::accumulator_t<ReductionOpT,
                           cub::detail::value_t<InputIteratorT>,
                           cub::detail::value_t<InputIteratorT>>,
-  // TODO: We should do our own tuning.
-  typename SelectedPolicy = DeviceScanByKeyPolicy<
+  typename SelectedPolicy = DeviceRollingReduceManualPolicy<
     thrust::transform_iterator<IndexToWindow<OffsetT, WindowSizeT>, thrust::counting_iterator<OffsetT>>,
     AccumT,
     InputIteratorT,
