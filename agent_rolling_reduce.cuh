@@ -62,7 +62,10 @@ template <typename KeyT,
           typename ValueT,
           cuda::memory_order MemoryOrder = cuda::memory_order_acq_rel,
           bool SINGLE_WORD = (Traits<ValueT>::PRIMITIVE) && (sizeof(ValueT) + sizeof(KeyT) < 8)>
-// TODO: Support 128-bit atomics.
+// TODO: Support 128-bit atomics?
+// TODO: Implement store synchronization for the compact case.
+// TODO: Combine store synchronization word with scan synchronization word; store
+// synchronization can just be an additional state after SCAN_TILE_INCLUSIVE.
 struct SynchronizingScanByKeyTileState;
 
 /**
@@ -79,7 +82,7 @@ struct SynchronizingScanByKeyTileState<KeyT, ValueT, MemoryOrder, false>
     // Status word type
     using StatusWord = unsigned int;
 
-    using AtomicRefStatusWord = cuda::atomic_ref<StatusWord, cuda::thread_scope_device>;
+    using AtomicRefStatusWord = cuda::atomic_ref<StatusWord, cuda::thread_scope_system>;
 
     static constexpr cuda::memory_order LoadMemoryOrder =
       MemoryOrder == cuda::memory_order_acq_rel ?
@@ -99,6 +102,7 @@ struct SynchronizingScanByKeyTileState<KeyT, ValueT, MemoryOrder, false>
 
     // Device storage
     StatusWord *d_tile_status;
+    StatusWord *d_tile_store;
     T          *d_tile_partial;
     T          *d_tile_inclusive;
 
@@ -107,6 +111,7 @@ struct SynchronizingScanByKeyTileState<KeyT, ValueT, MemoryOrder, false>
     SynchronizingScanByKeyTileState()
     :
         d_tile_status(nullptr),
+        d_tile_store(nullptr),
         d_tile_partial(nullptr),
         d_tile_inclusive(nullptr)
     {}
@@ -122,12 +127,13 @@ struct SynchronizingScanByKeyTileState<KeyT, ValueT, MemoryOrder, false>
         cudaError_t error = cudaSuccess;
         do
         {
-            void*   allocations[3] = {};
-            size_t  allocation_sizes[3];
+            void*   allocations[4] = {};
+            size_t  allocation_sizes[4];
 
             allocation_sizes[0] = (num_tiles + TILE_STATUS_PADDING) * sizeof(StatusWord);           // bytes needed for tile status descriptors
-            allocation_sizes[1] = (num_tiles + TILE_STATUS_PADDING) * sizeof(Uninitialized<T>);     // bytes needed for partials
-            allocation_sizes[2] = (num_tiles + TILE_STATUS_PADDING) * sizeof(Uninitialized<T>);     // bytes needed for inclusives
+            allocation_sizes[1] = (num_tiles) * sizeof(StatusWord);                                 // bytes needed for tile store signalling
+            allocation_sizes[2] = (num_tiles + TILE_STATUS_PADDING) * sizeof(Uninitialized<T>);     // bytes needed for partials
+            allocation_sizes[3] = (num_tiles + TILE_STATUS_PADDING) * sizeof(Uninitialized<T>);     // bytes needed for inclusives
 
             // Compute allocation pointers into the single storage blob
             error = CubDebug(
@@ -140,8 +146,9 @@ struct SynchronizingScanByKeyTileState<KeyT, ValueT, MemoryOrder, false>
 
             // Alias the offsets
             d_tile_status       = reinterpret_cast<StatusWord*>(allocations[0]);
-            d_tile_partial      = reinterpret_cast<T*>(allocations[1]);
-            d_tile_inclusive    = reinterpret_cast<T*>(allocations[2]);
+            d_tile_store        = reinterpret_cast<StatusWord*>(allocations[1]);
+            d_tile_partial      = reinterpret_cast<T*>(allocations[2]);
+            d_tile_inclusive    = reinterpret_cast<T*>(allocations[3]);
         }
         while (0);
 
@@ -158,13 +165,14 @@ struct SynchronizingScanByKeyTileState<KeyT, ValueT, MemoryOrder, false>
         size_t  &temp_storage_bytes)                ///< [out] Size in bytes of \t d_temp_storage allocation
     {
         // Specify storage allocation requirements
-        size_t  allocation_sizes[3];
+        size_t  allocation_sizes[4];
         allocation_sizes[0] = (num_tiles + TILE_STATUS_PADDING) * sizeof(StatusWord);         // bytes needed for tile status descriptors
-        allocation_sizes[1] = (num_tiles + TILE_STATUS_PADDING) * sizeof(Uninitialized<T>);   // bytes needed for partials
-        allocation_sizes[2] = (num_tiles + TILE_STATUS_PADDING) * sizeof(Uninitialized<T>);   // bytes needed for inclusives
+        allocation_sizes[1] = (num_tiles) * sizeof(StatusWord);                               // bytes needed for tile store signalling
+        allocation_sizes[2] = (num_tiles + TILE_STATUS_PADDING) * sizeof(Uninitialized<T>);   // bytes needed for partials
+        allocation_sizes[3] = (num_tiles + TILE_STATUS_PADDING) * sizeof(Uninitialized<T>);   // bytes needed for inclusives
 
         // Set the necessary size of the blob
-        void* allocations[3] = {};
+        void* allocations[4] = {};
         return CubDebug(AliasTemporaries(NULL, temp_storage_bytes, allocations, allocation_sizes));
     }
 
@@ -175,6 +183,7 @@ struct SynchronizingScanByKeyTileState<KeyT, ValueT, MemoryOrder, false>
     __device__ CUB_FORCE_INLINE void InitializeStatus(int num_tiles)
     {
         int tile_idx = (blockIdx.x * blockDim.x) + threadIdx.x;
+
         if (tile_idx < num_tiles)
         {
             // Not-yet-set
@@ -186,6 +195,8 @@ struct SynchronizingScanByKeyTileState<KeyT, ValueT, MemoryOrder, false>
             // Padding
             d_tile_status[threadIdx.x] = StatusWord(SCAN_TILE_OOB);
         }
+
+        d_tile_store[tile_idx] = 0;
     }
 
 
@@ -245,6 +256,24 @@ struct SynchronizingScanByKeyTileState<KeyT, ValueT, MemoryOrder, false>
     __device__ CUB_FORCE_INLINE T LoadValid(int tile_idx)
     {
         return d_tile_inclusive[TILE_STATUS_PADDING + tile_idx];
+    }
+
+    __device__ CUB_FORCE_INLINE void MarkStore(int tile_idx)
+    {
+        AtomicRefStatusWord alias(d_tile_store[tile_idx]);
+        alias.fetch_add(1, cuda::memory_order_release);
+        alias.notify_all();
+    }
+
+    __device__ CUB_FORCE_INLINE void WaitForStore(int tile_idx, int expected_count)
+    {
+        AtomicRefStatusWord alias(d_tile_store[tile_idx]);
+        while (true) {
+          StatusWord count = alias.load(cuda::memory_order_acquire);
+          if (count == expected_count)
+            break;
+          alias.wait(count, cuda::memory_order_acquire);
+        }
     }
 };
 
@@ -676,13 +705,12 @@ struct AgentRollingReduce
   using ReduceBySegmentOpT = ReduceBySegmentOp<ReductionOpT>;
 
   using SuffixScanTileStateT = SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_relaxed>;
-  using PrefixScanTileStateT = SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_acq_rel>;
+  using PrefixScanTileStateT = SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_relaxed>;
 
   // Constants
-  static constexpr int BLOCK_THREADS  = AgentRollingReducePolicyT::BLOCK_THREADS;
-  static constexpr int ITEMS_PER_THREAD =
-    AgentRollingReducePolicyT::ITEMS_PER_THREAD;
-  static constexpr int ITEMS_PER_TILE = BLOCK_THREADS * ITEMS_PER_THREAD;
+  static constexpr OffsetT BLOCK_THREADS    = AgentRollingReducePolicyT::BLOCK_THREADS;
+  static constexpr OffsetT ITEMS_PER_THREAD = AgentRollingReducePolicyT::ITEMS_PER_THREAD;
+  static constexpr OffsetT ITEMS_PER_TILE   = BLOCK_THREADS * ITEMS_PER_THREAD;
 
   using WrappedKeysInputIteratorT = cub::detail::conditional_t<
     std::is_pointer<KeysInputIteratorT>::value,
@@ -724,7 +752,7 @@ struct AgentRollingReduce
   using SuffixTileCallbackT =
     TilePrefixCallbackOp<SizeValuePairT, ReduceBySegmentOpT, SuffixScanTileStateT, 0, DelayConstructorT>;
   using PrefixTileCallbackT =
-    LazyTilePrefixCallbackOp<SizeValuePairT, ReduceBySegmentOpT, PrefixScanTileStateT, 0, DelayConstructorT>;
+    TilePrefixCallbackOp<SizeValuePairT, ReduceBySegmentOpT, PrefixScanTileStateT, 0, DelayConstructorT>;
 
   using BlockScanT = BlockScan<SizeValuePairT,
                                BLOCK_THREADS,
@@ -801,14 +829,36 @@ struct AgentRollingReduce
                      LookbackOp &lookback_op)
   {
     SizeValuePairT tile_aggregate;
+
     BlockScanT(storage.scan_storage.scan)
       .InclusiveScan(scan_items, scan_items, pair_reduce_op, lookback_op);
+
     tile_aggregate = lookback_op.GetBlockAggregate();
   }
 
   //---------------------------------------------------------------------
   // Utility methods
   //---------------------------------------------------------------------
+
+  __device__ CUB_FORCE_INLINE static constexpr OffsetT
+  ThreadIndex() { return threadIdx.x; }
+
+  struct PartnerTilesT {
+    OffsetT left;
+    OffsetT right;
+  };
+
+  template <bool IS_LAST_TILE>
+  __device__ CUB_FORCE_INLINE static constexpr PartnerTilesT
+  PartnerTiles(OffsetT tile_idx, OffsetT num_tiles) {
+    if (IS_LAST_TILE) return {0, 0};
+    OffsetT const candidate_tile = num_tiles - tile_idx - 1;
+    // Ensure we never falsely depend on a tile after the midpoint,
+    // which could otherwise happen if the midpoint is in
+    // the middle of a tile.
+    if (candidate_tile > tile_idx) return {tile_idx, tile_idx};
+    else return {candidate_tile - 1, candidate_tile};
+  }
 
   template <typename DestinationIterator>
   __device__ CUB_FORCE_INLINE void
@@ -821,7 +871,7 @@ struct AgentRollingReduce
     #pragma unroll
     for (int thread_item = 0; thread_item < ITEMS_PER_THREAD; thread_item++)
     {
-      OffsetT const tile_item    = OffsetT(threadIdx.x * ITEMS_PER_THREAD) + thread_item;
+      OffsetT const tile_item    = ThreadIndex() * ITEMS_PER_THREAD + thread_item;
       OffsetT const global_item  = tile_item + tile_base;
       bool const in_bounds       = tile_item < num_remaining;
       bool const before_midpoint = global_item < midpoint;
@@ -834,20 +884,20 @@ struct AgentRollingReduce
 
   template <typename DestinationIterator>
   __device__ CUB_FORCE_INLINE void
-  StoreAfterMidpoint(AccumT (&thread_src)[ITEMS_PER_THREAD],
-                     DestinationIterator global_dst,
-                     OffsetT num_remaining,
-                     OffsetT midpoint,
-                     OffsetT tile_base)
+  StoreAfterIncludingMidpoint(AccumT (&thread_src)[ITEMS_PER_THREAD],
+                              DestinationIterator global_dst,
+                              OffsetT num_remaining,
+                              OffsetT midpoint,
+                              OffsetT tile_base)
   {
     #pragma unroll
     for (int thread_item = 0; thread_item < ITEMS_PER_THREAD; thread_item++)
     {
-      OffsetT const tile_item   = OffsetT(threadIdx.x * ITEMS_PER_THREAD) + thread_item;
-      OffsetT const global_item = tile_item + tile_base;
-      bool const in_bounds      = tile_item < num_remaining;
-      bool const after_midpoint = global_item >= midpoint;
-      if (in_bounds && after_midpoint)
+      OffsetT const tile_item             = ThreadIndex() * ITEMS_PER_THREAD + thread_item;
+      OffsetT const global_item           = tile_item + tile_base;
+      bool const in_bounds                = tile_item < num_remaining;
+      bool const after_including_midpoint = global_item >= midpoint;
+      if (in_bounds && after_including_midpoint)
       {
         global_dst[global_item] = thread_src[thread_item];
       }
@@ -856,20 +906,20 @@ struct AgentRollingReduce
 
   template <typename SourceIterator>
   __device__ CUB_FORCE_INLINE void
-  LoadAfterMidpoint(SourceIterator global_src,
-                    AccumT (&thread_dst)[ITEMS_PER_THREAD],
-                    OffsetT num_remaining,
-                    OffsetT midpoint,
-                    OffsetT tile_base)
+  LoadAfterIncludingMidpoint(SourceIterator global_src,
+                             AccumT (&thread_dst)[ITEMS_PER_THREAD],
+                             OffsetT num_remaining,
+                             OffsetT midpoint,
+                             OffsetT tile_base)
   {
     #pragma unroll
     for (int thread_item = 0; thread_item < ITEMS_PER_THREAD; thread_item++)
     {
-      OffsetT const tile_item   = OffsetT(threadIdx.x * ITEMS_PER_THREAD) + thread_item;
-      OffsetT const global_item = tile_item + tile_base;
-      bool const in_bounds      = tile_item < num_remaining;
-      bool const after_midpoint = global_item >= midpoint;
-      if (in_bounds && after_midpoint)
+      OffsetT const tile_item             = ThreadIndex() * ITEMS_PER_THREAD + thread_item;
+      OffsetT const global_item           = tile_item + tile_base;
+      bool const in_bounds                = tile_item < num_remaining;
+      bool const after_including_midpoint = global_item >= midpoint;
+      if (in_bounds && after_including_midpoint)
       {
         thread_dst[thread_item] = global_src[global_item];
       }
@@ -877,21 +927,21 @@ struct AgentRollingReduce
   }
 
   __device__ CUB_FORCE_INLINE void
-  FinalReduceAfterMidpoint(AccumT (&suffix)[ITEMS_PER_THREAD],
-                           AccumT (&prefix)[ITEMS_PER_THREAD],
-                           AccumT (&result)[ITEMS_PER_THREAD],
-                           OffsetT num_remaining,
-                           OffsetT midpoint,
-                           OffsetT tile_base)
+  FinalReduceAfterIncludingMidpoint(AccumT (&suffix)[ITEMS_PER_THREAD],
+                                    AccumT (&prefix)[ITEMS_PER_THREAD],
+                                    AccumT (&result)[ITEMS_PER_THREAD],
+                                    OffsetT num_remaining,
+                                    OffsetT midpoint,
+                                    OffsetT tile_base)
   {
     #pragma unroll
     for (int thread_item = 0; thread_item < ITEMS_PER_THREAD; thread_item++)
     {
-      OffsetT const tile_item   = OffsetT(threadIdx.x * ITEMS_PER_THREAD) + thread_item;
-      OffsetT const global_item = tile_item + tile_base;
-      bool const in_bounds      = tile_item < num_remaining;
-      bool const after_midpoint = global_item >= midpoint;
-      if (in_bounds && after_midpoint)
+      OffsetT const tile_item             = ThreadIndex() * ITEMS_PER_THREAD + thread_item;
+      OffsetT const global_item           = tile_item + tile_base;
+      bool const in_bounds                = tile_item < num_remaining;
+      bool const after_including_midpoint = global_item >= midpoint;
+      if (in_bounds && after_including_midpoint)
       {
         result[thread_item] = reduce_op(suffix[thread_item], prefix[thread_item]);
       }
@@ -910,8 +960,7 @@ struct AgentRollingReduce
     for (int ITEM = 0; ITEM < ITEMS_PER_THREAD; ++ITEM)
     {
       // Set segment_flags for first out-of-bounds item, zero for others
-      if (IS_LAST_TILE &&
-          OffsetT(threadIdx.x * ITEMS_PER_THREAD) + ITEM == num_remaining)
+      if (IS_LAST_TILE && ThreadIndex() * ITEMS_PER_THREAD + ITEM == num_remaining)
       {
         segment_flags[ITEM] = 1;
       }
@@ -936,22 +985,37 @@ struct AgentRollingReduce
   // Cooperatively scan a device-wide sequence of tiles with other CTAs
   //---------------------------------------------------------------------
 
-  // TODO: Distinguish between pre-midpoint, midpoint, and post-midpoint tiles
-  // at compile time.
+  // TODO: Distinguish between first, pre-midpoint, midpoint, post-midpoint,
+  // and last tiles at compile time.
+
+  // TODO: Audit CTA_SYNCs
+
+  // TODO: Merge scan passes
 
   // Process a tile of input (dynamic chained scan)
   template <bool IS_LAST_TILE>
   __device__ CUB_FORCE_INLINE void ConsumeTile(OffsetT num_items,
-                                               OffsetT num_remaining,
-                                               int tile_idx,
-                                               OffsetT tile_base,
+                                               OffsetT tile_idx,
                                                SuffixScanTileStateT &suffix_tile_state,
                                                PrefixScanTileStateT &prefix_tile_state)
   {
-    OffsetT const midpoint         = num_items <= 1 ? 0
-                                   : num_items / 2;
-    OffsetT const reverse_midpoint = num_items <= 1 ? 0
-                                   : (num_items + 2 - 1) / 2;
+    OffsetT const num_tiles     = DivideAndRoundUp(num_items, ITEMS_PER_TILE);
+    OffsetT const tile_base     = ITEMS_PER_TILE * tile_idx;
+    OffsetT const num_remaining = num_items - tile_base;
+
+    OffsetT const midpoint         = num_items / 2;
+    OffsetT const reverse_midpoint = DivideAndRoundUp(num_items, 2);
+
+    bool const tile_before_midpoint   = tile_base < midpoint;
+    bool const tile_contains_midpoint = tile_base <= midpoint && tile_base + ITEMS_PER_TILE > midpoint;
+    bool const tile_after_midpoint    = tile_base >= midpoint;
+
+    PartnerTilesT const partner_tiles = PartnerTiles<IS_LAST_TILE>(tile_idx, num_tiles);
+
+    // TODO: Remove debugging code
+    //if (threadIdx.x == 0)
+    //  printf("Tile %i, num_items %i, midpoint %i, items_per_tile %i, tile_base %i, tile_before_midpoint: %i, tile_contains_midpoint: %i, tile_after_midpoint: %i\n",
+    //    tile_idx, num_items, midpoint, ITEMS_PER_TILE, tile_base, int(tile_before_midpoint), int(tile_contains_midpoint), int(tile_after_midpoint));
 
     ///////////////////////////////////////////////////////////////////////////
     // Load items
@@ -1057,8 +1121,6 @@ struct AgentRollingReduce
     // Prefix scan with acquire/release semantics. This ensures that the store
     // of the suffix scan to the input will be visible after the prefix scan.
 
-    SizeValuePairT tile_aggregate;
-
     PrefixTileCallbackT lookback_op(prefix_tile_state,
                                     storage.scan_storage.prefix_lookback,
                                     pair_reduce_op,
@@ -1071,8 +1133,7 @@ struct AgentRollingReduce
                                       scan_items,
                                       num_remaining);
 
-      BlockScanT(storage.scan_storage.scan)
-        .InclusiveScan(scan_items, scan_items, pair_reduce_op, tile_aggregate);
+      ScanFirstTile<IS_LAST_TILE>(scan_items, prefix_tile_state);
     }
     else
     {
@@ -1093,28 +1154,30 @@ struct AgentRollingReduce
                         d_out,
                         num_remaining, midpoint, tile_base);
 
-    cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_device);
-
-    CTA_SYNC();
-
     ///////////////////////////////////////////////////////////////////////////
-    // Publish prefix scan
+    // Point to point acquire/release synchronization of before and including
+    // midpoint stores to tiles that need to load them.
 
-    if (tile_idx == 0) // First tile
+    if (tile_before_midpoint || tile_contains_midpoint)
     {
-      if (threadIdx.x == 0)
-      {
-        if (!IS_LAST_TILE)
-        {
-          prefix_tile_state.SetInclusive(0, tile_aggregate);
-        }
-
-        scan_items[0].key = 0;
-      }
+      // TODO: Remove debugging code.
+      //if (threadIdx.x == 0)
+      //  printf("Tile %i marking store\n", tile_idx);
+      prefix_tile_state.MarkStore(tile_idx);
     }
-    else
+
+    if (tile_contains_midpoint || tile_after_midpoint)
     {
-      lookback_op.PublishTileStatus();
+      // TODO: Remove debugging code.
+      //if (threadIdx.x == 0)
+      //  printf("Tile %i waiting for stores, partner_tiles.left: %i, partner_tiles.right: %i\n",
+      //    tile_idx, partner_tiles.left, partner_tiles.right);
+      prefix_tile_state.WaitForStore(partner_tiles.left,  BLOCK_THREADS);
+      prefix_tile_state.WaitForStore(partner_tiles.right, BLOCK_THREADS);
+      // TODO: Remove debugging code.
+      //if (threadIdx.x == 0)
+      //  printf("Tile %i done waiting for stores, partner_tiles.left: %i, partner_tiles.right: %i\n",
+      //    tile_idx, partner_tiles.left, partner_tiles.right);
     }
 
     CTA_SYNC();
@@ -1124,36 +1187,36 @@ struct AgentRollingReduce
 
     AccumT lookback[ITEMS_PER_THREAD];
 
-    LoadAfterMidpoint(d_out,
-                      lookback,
-                      num_remaining, midpoint, tile_base);
+    LoadAfterIncludingMidpoint(d_out,
+                               lookback,
+                               num_remaining, midpoint, tile_base);
 
     ///////////////////////////////////////////////////////////////////////////
     // Tail reduction
 
-    FinalReduceAfterMidpoint(prefix, lookback, lookback,
-                             num_remaining, midpoint, tile_base);
+    FinalReduceAfterIncludingMidpoint(prefix, lookback, lookback,
+                                      num_remaining, midpoint, tile_base);
 
-    StoreAfterMidpoint(lookback,
-                       d_out,
-                       num_remaining, midpoint, tile_base);
+    StoreAfterIncludingMidpoint(lookback,
+                                d_out,
+                                num_remaining, midpoint, tile_base);
 
     ///////////////////////////////////////////////////////////////////////////
     // Load head from global output
 
-    LoadAfterMidpoint(d_reverse_out,
-                      lookback,
-                      num_remaining, reverse_midpoint, tile_base);
+    LoadAfterIncludingMidpoint(d_reverse_out,
+                               lookback,
+                               num_remaining, reverse_midpoint, tile_base);
 
     ///////////////////////////////////////////////////////////////////////////
     // Head reduction
 
-    FinalReduceAfterMidpoint(lookback, suffix, lookback,
-                             num_remaining, reverse_midpoint, tile_base);
+    FinalReduceAfterIncludingMidpoint(lookback, suffix, lookback,
+                                      num_remaining, reverse_midpoint, tile_base);
 
-    StoreAfterMidpoint(lookback,
-                       d_reverse_out,
-                       num_remaining, reverse_midpoint, tile_base);
+    StoreAfterIncludingMidpoint(lookback,
+                                d_reverse_out,
+                                num_remaining, reverse_midpoint, tile_base);
   }
 
   //---------------------------------------------------------------------
@@ -1195,21 +1258,19 @@ struct AgentRollingReduce
    *   The starting tile for the current grid
    */
   __device__ CUB_FORCE_INLINE void ConsumeRange(OffsetT num_items,
+                                                OffsetT start_tile,
                                                 SuffixScanTileStateT &suffix_tile_state,
-                                                PrefixScanTileStateT &prefix_tile_state,
-                                                int start_tile)
+                                                PrefixScanTileStateT &prefix_tile_state)
   {
-    int tile_idx          = blockIdx.x;
-    OffsetT tile_base     = OffsetT(ITEMS_PER_TILE) * tile_idx;
-    OffsetT num_remaining = num_items - tile_base;
+    OffsetT const tile_idx      = blockIdx.x;
+    OffsetT const tile_base     = ITEMS_PER_TILE * tile_idx;
+    OffsetT const num_remaining = num_items - tile_base;
 
     if (num_remaining > ITEMS_PER_TILE)
     {
       // Not the last tile (full)
       ConsumeTile<false>(num_items,
-                         num_remaining,
                          tile_idx,
-                         tile_base,
                          suffix_tile_state,
                          prefix_tile_state);
     }
@@ -1217,9 +1278,7 @@ struct AgentRollingReduce
     {
       // The last tile (possibly partially-full)
       ConsumeTile<true>(num_items,
-                        num_remaining,
                         tile_idx,
-                        tile_base,
                         suffix_tile_state,
                         prefix_tile_state);
     }

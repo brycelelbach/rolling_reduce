@@ -76,8 +76,8 @@ struct DeviceRollingReduceManualPolicy
   struct ManualTuning : ChainedPolicy<800, ManualTuning, ManualTuning>
   {
     using ScanByKeyPolicyT =
-      AgentRollingReducePolicy<512,
-                               6,
+      AgentRollingReducePolicy<256,
+                               9,
                                BLOCK_LOAD_WARP_TRANSPOSE,
                                LOAD_DEFAULT,
                                BLOCK_SCAN_WARP_SCANS,

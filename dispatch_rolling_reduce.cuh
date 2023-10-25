@@ -108,7 +108,7 @@ CUB_DETAIL_KERNEL_ATTRIBUTES void DeviceRollingReduceKernel(KeysInputIteratorT d
                       d_out,
                       d_reverse_out,
                       reduction_op)
-    .ConsumeRange(num_items, suffix_tile_state, prefix_tile_state, start_tile);
+    .ConsumeRange(num_items, start_tile, suffix_tile_state, prefix_tile_state);
 }
 
 template <typename SuffixTileStateT,
@@ -262,7 +262,7 @@ struct DispatchRollingReduce : SelectedPolicy
     using RollingReduceSuffixTileStateT =
       SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_relaxed>;
     using RollingReducePrefixTileStateT =
-      SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_acq_rel>;
+      SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_relaxed>;
 
     cudaError error = cudaSuccess;
     do
@@ -390,8 +390,7 @@ struct DispatchRollingReduce : SelectedPolicy
 
       // Run grids in epochs (in case number of tiles exceeds max x-dimension
       int scan_grid_size = CUB_MIN(num_tiles, max_dim_x);
-      for (int start_tile = 0; start_tile < num_tiles;
-           start_tile += scan_grid_size)
+      for (int start_tile = 0; start_tile < num_tiles; start_tile += scan_grid_size)
       {
         // Log scan_kernel configuration
         #ifdef CUB_DETAIL_DEBUG_ENABLE_LOG
@@ -451,7 +450,7 @@ struct DispatchRollingReduce : SelectedPolicy
     using RollingReduceSuffixTileStateT =
       SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_relaxed>;
     using RollingReducePrefixTileStateT =
-      SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_acq_rel>;
+      SynchronizingScanByKeyTileState<AccumT, OffsetT, cuda::memory_order_relaxed>;
 
     // Ensure kernels are instantiated.
     return Invoke<ActivePolicyT>(
