@@ -73,6 +73,7 @@ template <typename ChainedPolicyT,
 __launch_bounds__(int(ChainedPolicyT::ActivePolicy::ScanByKeyPolicyT::BLOCK_THREADS))
 CUB_DETAIL_KERNEL_ATTRIBUTES void DeviceRollingReduceKernel(KeysInputIteratorT d_keys_in,
                                                             KeyT *d_keys_prev_in,
+                                                            KeyT *d_keys_succ_in,
                                                             InputIteratorT d_in,
                                                             ReverseInputIteratorT d_reverse_in,
                                                             OutputIteratorT d_out,
@@ -103,6 +104,7 @@ CUB_DETAIL_KERNEL_ATTRIBUTES void DeviceRollingReduceKernel(KeysInputIteratorT d
   AgentRollingReduceT(temp_storage,
                       d_keys_in,
                       d_keys_prev_in,
+                      d_keys_succ_in,
                       d_in,
                       d_reverse_in,
                       d_out,
@@ -119,6 +121,7 @@ DeviceRollingReduceInitKernel(SuffixTileStateT suffix_tile_state,
                               PrefixTileStateT prefix_tile_state,
                               KeysInputIteratorT d_keys_in,
                               cub::detail::value_t<KeysInputIteratorT> *d_keys_prev_in,
+                              cub::detail::value_t<KeysInputIteratorT> *d_keys_succ_in,
                               unsigned items_per_tile,
                               int num_tiles)
 {
@@ -132,6 +135,11 @@ DeviceRollingReduceInitKernel(SuffixTileStateT suffix_tile_state,
   if (tid > 0 && tid < num_tiles)
   {
     d_keys_prev_in[tid] = d_keys_in[tile_base - 1];
+  }
+
+  if (tid < num_tiles - 1)
+  {
+    d_keys_succ_in[tid] = d_keys_in[(tid + 1) * items_per_tile];
   }
 }
 
@@ -281,23 +289,25 @@ struct DispatchRollingReduce : SelectedPolicy
         static_cast<int>(cub::DivideAndRoundUp(num_items, tile_size));
 
       // Specify temporary storage allocation requirements
-      size_t allocation_sizes[3];
+      size_t allocation_sizes[4];
       error = CubDebug(RollingReduceSuffixTileStateT::AllocationSize(num_tiles, allocation_sizes[0]));
       if (cudaSuccess != error)
       {
-        break; // bytes needed for tile status descriptors
+        break;
       }
       error = CubDebug(RollingReducePrefixTileStateT::AllocationSize(num_tiles, allocation_sizes[1]));
       if (cudaSuccess != error)
       {
-        break; // bytes needed for tile status descriptors
+        break;
       }
 
+      // TODO: Do these have to be +1?
       allocation_sizes[2] = sizeof(KeyT) * (num_tiles + 1);
+      allocation_sizes[3] = sizeof(KeyT) * (num_tiles + 1);
 
       // Compute allocation pointers into the single storage blob (or compute
       // the necessary size of the blob)
-      void *allocations[3] = {};
+      void *allocations[4] = {};
 
       error = CubDebug(
         AliasTemporaries(d_temp_storage, temp_storage_bytes, allocations, allocation_sizes));
@@ -320,12 +330,13 @@ struct DispatchRollingReduce : SelectedPolicy
       }
 
       KeyT *d_keys_prev_in = reinterpret_cast<KeyT *>(allocations[2]);
+      KeyT *d_keys_succ_in = reinterpret_cast<KeyT *>(allocations[3]);
 
       // Construct the tile status interface
       RollingReduceSuffixTileStateT suffix_tile_state;
       RollingReducePrefixTileStateT prefix_tile_state;
-      error = CubDebug(suffix_tile_state.Init(num_tiles, allocations[1], allocation_sizes[1]));
-      error = CubDebug(prefix_tile_state.Init(num_tiles, allocations[0], allocation_sizes[0]));
+      error = CubDebug(suffix_tile_state.Init(num_tiles, allocations[0], allocation_sizes[0]));
+      error = CubDebug(prefix_tile_state.Init(num_tiles, allocations[1], allocation_sizes[1]));
       if (cudaSuccess != error)
       {
         break;
@@ -352,6 +363,7 @@ struct DispatchRollingReduce : SelectedPolicy
               prefix_tile_state,
               d_keys_in,
               d_keys_prev_in,
+              d_keys_succ_in,
               tile_size,
               num_tiles);
 
@@ -413,6 +425,7 @@ struct DispatchRollingReduce : SelectedPolicy
           .doit(scan_kernel,
                 d_keys_in,
                 d_keys_prev_in,
+                d_keys_succ_in,
                 d_in,
                 d_reverse_in,
                 d_out,

@@ -289,6 +289,12 @@ auto generate_input(std::size_t problem_size) {
 
 auto generate_iota(std::size_t problem_size, int init) {
   thrust::universal_vector<int> input(problem_size);
+  thrust::sequence(input.begin(), input.end(), init);
+  return std::move(input);
+}
+
+auto generate_reverse_iota(std::size_t problem_size, int init) {
+  thrust::universal_vector<int> input(problem_size);
   thrust::sequence(input.rbegin(), input.rend(), init);
   return std::move(input);
 }
@@ -350,16 +356,29 @@ NVBENCH_BENCH_TYPES(benchmark_rolling_maximum, NVBENCH_TYPE_AXES(benchmark_algor
 
 int main(int argc, char const* const* argv) {
   // TODO: Test windows that don't cleanly divide.
+
   test_all_rolling_maximum({}, window_size_t<1>{});
   test_all_rolling_maximum({7}, window_size_t<1>{});
+
   test_all_rolling_maximum({3, 8, 1, 2}, window_size_t<2>{});
   test_all_rolling_maximum({1, 6, 3, 8, 9, 6, 5, 4, 3}, window_size_t<3>());
-  test_all_rolling_maximum({1, 2, 3, 6, 5, 4, 7, 8, 9}, window_size_t<3>());
-  test_all_rolling_maximum({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, window_size_t<2>());
+
+  test_all_rolling_maximum(generate_iota(9, 1), window_size_t<3>());
+  test_all_rolling_maximum(generate_iota(12, 1), window_size_t<2>());
+
+  // Has distinct first, before midpoint, midpoint, after midpoint, and last scan segments.
+  // Midpoint is at the end of a scan segment.
+  test_all_rolling_maximum(generate_reverse_iota(15, 1), window_size_t<3>());
+
+  // Should be multi-thread.
   test_all_rolling_maximum(generate_input(1024), window_size_t<2>());
   test_all_rolling_maximum(generate_input(1024), window_size_t<4>());
   test_all_rolling_maximum(generate_input(1024), window_size_t<64>());
-  test_all_rolling_maximum(generate_iota(4096, 1), window_size_t<2>());
+
+  // Should be multi-block.
+  test_all_rolling_maximum(generate_reverse_iota(4096, 1), window_size_t<2>());
+
+  // Scale test.
   test_all_rolling_maximum(generate_input(1 << 18), window_size_t<2>());
 
   NVBENCH_MAIN_BODY(argc, argv);

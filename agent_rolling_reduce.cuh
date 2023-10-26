@@ -786,6 +786,7 @@ struct AgentRollingReduce
   TempStorage_ &storage;
   WrappedKeysInputIteratorT d_keys_in;
   KeyT *d_keys_prev_in;
+  KeyT *d_keys_succ_in;
   WrappedInputIteratorT d_in;
   WrappedReverseInputIteratorT d_reverse_in;
   OutputIteratorT d_out;
@@ -864,6 +865,7 @@ struct AgentRollingReduce
   __device__ CUB_FORCE_INLINE void
   StoreBeforeMidpoint(AccumT (&thread_src)[ITEMS_PER_THREAD],
                       DestinationIterator global_dst,
+                      OffsetT (&skip)[ITEMS_PER_THREAD],
                       OffsetT num_remaining,
                       OffsetT midpoint,
                       OffsetT tile_base)
@@ -875,7 +877,7 @@ struct AgentRollingReduce
       OffsetT const global_item  = tile_item + tile_base;
       bool const in_bounds       = tile_item < num_remaining;
       bool const before_midpoint = global_item < midpoint;
-      if (in_bounds && before_midpoint)
+      if (in_bounds && before_midpoint && !skip[thread_item])
       {
         global_dst[global_item] = thread_src[thread_item];
       }
@@ -927,9 +929,10 @@ struct AgentRollingReduce
   }
 
   __device__ CUB_FORCE_INLINE void
-  FinalReduceAfterIncludingMidpoint(AccumT (&suffix)[ITEMS_PER_THREAD],
-                                    AccumT (&prefix)[ITEMS_PER_THREAD],
+  FinalReduceAfterIncludingMidpoint(AccumT (&local)[ITEMS_PER_THREAD],
+                                    AccumT (&lookback)[ITEMS_PER_THREAD],
                                     AccumT (&result)[ITEMS_PER_THREAD],
+                                    OffsetT (&skip)[ITEMS_PER_THREAD],
                                     OffsetT num_remaining,
                                     OffsetT midpoint,
                                     OffsetT tile_base)
@@ -943,7 +946,14 @@ struct AgentRollingReduce
       bool const after_including_midpoint = global_item >= midpoint;
       if (in_bounds && after_including_midpoint)
       {
-        result[thread_item] = reduce_op(suffix[thread_item], prefix[thread_item]);
+        if (skip[thread_item])
+        {
+          result[thread_item] = local[thread_item];
+        }
+        else
+        {
+          result[thread_item] = reduce_op(local[thread_item], lookback[thread_item]);
+        }
       }
     }
   }
@@ -951,22 +961,22 @@ struct AgentRollingReduce
   template <bool IS_LAST_TILE>
   __device__ CUB_FORCE_INLINE void
   ZipValuesAndFlags(AccumT  (&values)[ITEMS_PER_THREAD],
-                    OffsetT (&segment_flags)[ITEMS_PER_THREAD],
+                    OffsetT (&segment_head_flags)[ITEMS_PER_THREAD],
                     SizeValuePairT (&scan_items)[ITEMS_PER_THREAD],
                     OffsetT num_remaining)
   {
-    // Zip values and segment_flags
+    // Zip values and segment_head_flags
     #pragma unroll
     for (int ITEM = 0; ITEM < ITEMS_PER_THREAD; ++ITEM)
     {
-      // Set segment_flags for first out-of-bounds item, zero for others
+      // Set segment_head_flags for first out-of-bounds item, zero for others
       if (IS_LAST_TILE && ThreadIndex() * ITEMS_PER_THREAD + ITEM == num_remaining)
       {
-        segment_flags[ITEM] = 1;
+        segment_head_flags[ITEM] = 1;
       }
 
       scan_items[ITEM].value = values[ITEM];
-      scan_items[ITEM].key   = segment_flags[ITEM];
+      scan_items[ITEM].key   = segment_head_flags[ITEM];
     }
   }
 
@@ -1011,11 +1021,6 @@ struct AgentRollingReduce
     bool const tile_after_midpoint    = tile_base >= midpoint;
 
     PartnerTilesT const partner_tiles = PartnerTiles<IS_LAST_TILE>(tile_idx, num_tiles);
-
-    // TODO: Remove debugging code
-    //if (threadIdx.x == 0)
-    //  printf("Tile %i, num_items %i, midpoint %i, items_per_tile %i, tile_base %i, tile_before_midpoint: %i, tile_contains_midpoint: %i, tile_after_midpoint: %i\n",
-    //    tile_idx, num_items, midpoint, ITEMS_PER_TILE, tile_base, int(tile_before_midpoint), int(tile_contains_midpoint), int(tile_after_midpoint));
 
     ///////////////////////////////////////////////////////////////////////////
     // Load items
@@ -1069,16 +1074,32 @@ struct AgentRollingReduce
     ///////////////////////////////////////////////////////////////////////////
     // Suffix scan with relaxed semantics
 
-    OffsetT segment_flags[ITEMS_PER_THREAD];
+    OffsetT segment_head_flags[ITEMS_PER_THREAD];
+    OffsetT segment_tail_flags[ITEMS_PER_THREAD];
     SizeValuePairT scan_items[ITEMS_PER_THREAD];
 
     if (tile_idx == 0) // First tile
     {
-      BlockDiscontinuityKeysT(storage.scan_storage.discontinuity)
-        .FlagHeads(segment_flags, keys, inequality_op);
+      if (IS_LAST_TILE)
+      {
+        BlockDiscontinuityKeysT(storage.scan_storage.discontinuity)
+          .FlagHeadsAndTails(segment_head_flags,
+                             segment_tail_flags,
+                             keys, inequality_op);
+      }
+      else
+      {
+        KeyT const tile_succ_key = (threadIdx.x == BLOCK_THREADS - 1)
+                                 ? d_keys_succ_in[tile_idx] : KeyT();
+
+        BlockDiscontinuityKeysT(storage.scan_storage.discontinuity)
+          .FlagHeadsAndTails(segment_head_flags,
+                             segment_tail_flags, tile_succ_key,
+                             keys, inequality_op);
+      }
 
       ZipValuesAndFlags<IS_LAST_TILE>(suffix,
-                                      segment_flags,
+                                      segment_head_flags,
                                       scan_items,
                                       num_remaining);
 
@@ -1086,14 +1107,29 @@ struct AgentRollingReduce
     }
     else
     {
-      KeyT tile_pred_key = (threadIdx.x == 0) ? d_keys_prev_in[tile_idx]
-                                              : KeyT();
+      KeyT const tile_pred_key = (threadIdx.x == 0)
+                               ? d_keys_prev_in[tile_idx] : KeyT();
 
-      BlockDiscontinuityKeysT(storage.scan_storage.discontinuity)
-        .FlagHeads(segment_flags, keys, inequality_op, tile_pred_key);
+      if (IS_LAST_TILE)
+      {
+        BlockDiscontinuityKeysT(storage.scan_storage.discontinuity)
+          .FlagHeadsAndTails(segment_head_flags, tile_pred_key,
+                             segment_tail_flags,
+                             keys, inequality_op);
+      }
+      else
+      {
+        KeyT const tile_succ_key = (threadIdx.x == BLOCK_THREADS - 1)
+                                 ? d_keys_succ_in[tile_idx] : KeyT();
+
+        BlockDiscontinuityKeysT(storage.scan_storage.discontinuity)
+          .FlagHeadsAndTails(segment_head_flags, tile_pred_key,
+                             segment_tail_flags, tile_succ_key,
+                             keys, inequality_op);
+      }
 
       ZipValuesAndFlags<IS_LAST_TILE>(suffix,
-                                      segment_flags,
+                                      segment_head_flags,
                                       scan_items,
                                       num_remaining);
 
@@ -1113,6 +1149,7 @@ struct AgentRollingReduce
 
     StoreBeforeMidpoint(suffix,
                         d_reverse_out,
+                        segment_tail_flags,
                         num_remaining, reverse_midpoint, tile_base);
 
     CTA_SYNC();
@@ -1129,7 +1166,7 @@ struct AgentRollingReduce
     if (tile_idx == 0) // First tile
     {
       ZipValuesAndFlags<IS_LAST_TILE>(prefix,
-                                      segment_flags,
+                                      segment_head_flags,
                                       scan_items,
                                       num_remaining);
 
@@ -1138,7 +1175,7 @@ struct AgentRollingReduce
     else
     {
       ZipValuesAndFlags<IS_LAST_TILE>(prefix,
-                                      segment_flags,
+                                      segment_head_flags,
                                       scan_items,
                                       num_remaining);
 
@@ -1152,6 +1189,7 @@ struct AgentRollingReduce
 
     StoreBeforeMidpoint(prefix,
                         d_out,
+                        segment_tail_flags,
                         num_remaining, midpoint, tile_base);
 
     ///////////////////////////////////////////////////////////////////////////
@@ -1160,24 +1198,13 @@ struct AgentRollingReduce
 
     if (tile_before_midpoint || tile_contains_midpoint)
     {
-      // TODO: Remove debugging code.
-      //if (threadIdx.x == 0)
-      //  printf("Tile %i marking store\n", tile_idx);
       prefix_tile_state.MarkStore(tile_idx);
     }
 
     if (tile_contains_midpoint || tile_after_midpoint)
     {
-      // TODO: Remove debugging code.
-      //if (threadIdx.x == 0)
-      //  printf("Tile %i waiting for stores, partner_tiles.left: %i, partner_tiles.right: %i\n",
-      //    tile_idx, partner_tiles.left, partner_tiles.right);
       prefix_tile_state.WaitForStore(partner_tiles.left,  BLOCK_THREADS);
       prefix_tile_state.WaitForStore(partner_tiles.right, BLOCK_THREADS);
-      // TODO: Remove debugging code.
-      //if (threadIdx.x == 0)
-      //  printf("Tile %i done waiting for stores, partner_tiles.left: %i, partner_tiles.right: %i\n",
-      //    tile_idx, partner_tiles.left, partner_tiles.right);
     }
 
     CTA_SYNC();
@@ -1187,6 +1214,10 @@ struct AgentRollingReduce
 
     AccumT lookback[ITEMS_PER_THREAD];
 
+    // TODO: We currently just load garbage from output for the boundary items,
+    // but we don't use the garbage because the final reduce is guarded by
+    // checking `segment_tail_flags`. Should we load conditionally based on
+    // `segment_tail_flags` here? Would that help or hurt performance?
     LoadAfterIncludingMidpoint(d_out,
                                lookback,
                                num_remaining, midpoint, tile_base);
@@ -1194,7 +1225,7 @@ struct AgentRollingReduce
     ///////////////////////////////////////////////////////////////////////////
     // Tail reduction
 
-    FinalReduceAfterIncludingMidpoint(prefix, lookback, lookback,
+    FinalReduceAfterIncludingMidpoint(prefix, lookback, lookback, segment_tail_flags,
                                       num_remaining, midpoint, tile_base);
 
     StoreAfterIncludingMidpoint(lookback,
@@ -1204,6 +1235,10 @@ struct AgentRollingReduce
     ///////////////////////////////////////////////////////////////////////////
     // Load head from global output
 
+    // TODO: We currently just load garbage from output for the boundary items,
+    // but we don't use the garbage because the final reduce is guarded by
+    // checking `segment_tail_flags`. Should we load conditionally based on
+    // `segment_tail_flags` here? Would that help or hurt performance?
     LoadAfterIncludingMidpoint(d_reverse_out,
                                lookback,
                                num_remaining, reverse_midpoint, tile_base);
@@ -1211,7 +1246,7 @@ struct AgentRollingReduce
     ///////////////////////////////////////////////////////////////////////////
     // Head reduction
 
-    FinalReduceAfterIncludingMidpoint(lookback, suffix, lookback,
+    FinalReduceAfterIncludingMidpoint(suffix, lookback, lookback, segment_tail_flags,
                                       num_remaining, reverse_midpoint, tile_base);
 
     StoreAfterIncludingMidpoint(lookback,
@@ -1228,6 +1263,7 @@ struct AgentRollingReduce
   __device__ CUB_FORCE_INLINE AgentRollingReduce(TempStorage &storage,
                                                  KeysInputIteratorT d_keys_in,
                                                  KeyT *d_keys_prev_in,
+                                                 KeyT *d_keys_succ_in,
                                                  InputIteratorT d_in,
                                                  ReverseInputIteratorT d_reverse_in,
                                                  OutputIteratorT d_out,
@@ -1236,6 +1272,7 @@ struct AgentRollingReduce
       : storage(storage.Alias())
       , d_keys_in(d_keys_in)
       , d_keys_prev_in(d_keys_prev_in)
+      , d_keys_succ_in(d_keys_succ_in)
       , d_in(d_in)
       , d_reverse_in(d_reverse_in)
       , d_out(d_out)
